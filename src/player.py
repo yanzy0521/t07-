@@ -299,63 +299,6 @@ class Player:
         self._draw_kick_target(tackle_target)
         return tackle_direction, DEFENSIVE_PRESSER_TACKLE_POWER
 
-    def _ball_is_in_own_penalty_area(self) -> bool:
-        """判断当前球是否位于由场地尺寸定义的己方禁区内。"""
-        context = self.context
-        ball = context.ball if context is not None else None
-        if context is None or ball is None:
-            return False
-
-        own_goal_line_x = -context.field.length / 2.0
-        penalty_area_front_x = (
-            own_goal_line_x + context.field.penalty_area_length
-        )
-        penalty_area_half_width = context.field.penalty_area_width / 2.0
-        return (
-            own_goal_line_x <= ball.x <= penalty_area_front_x
-            and abs(ball.y) <= penalty_area_half_width
-        )
-
-    def _is_behind_ball_for_penalty_tackle(self) -> bool:
-        """禁区内只确认纵向位于球的己方球门侧，不做角度校准。"""
-        ball = self.context.ball if self.context is not None else None
-        pose = self.pose
-        if ball is None or pose is None:
-            return False
-        return (
-            pose.x
-            <= ball.x - DEFENSIVE_PRESSER_PENALTY_BEHIND_MARGIN_M
-        )
-
-    def _get_penalty_tackle_reposition_target(
-        self,
-    ) -> tuple[float, float] | None:
-        """返回球障碍外的可达后侧点，避免错误侧直接触球。"""
-        context = self.context
-        ball = context.ball if context is not None else None
-        if context is None or ball is None:
-            return None
-
-        half_length = max(
-            0.0,
-            context.field.length / 2.0
-            - DEFENSIVE_PRESSER_PENALTY_TARGET_FIELD_MARGIN_M,
-        )
-        half_width = max(
-            0.0,
-            context.field.width / 2.0
-            - DEFENSIVE_PRESSER_PENALTY_TARGET_FIELD_MARGIN_M,
-        )
-        return (
-            clamp(
-                ball.x
-                - DEFENSIVE_PRESSER_PENALTY_BEHIND_TARGET_DISTANCE_M,
-                -half_length,
-                half_length,
-            ),
-            clamp(ball.y, -half_width, half_width),
-        )
-
     def _goal_target_for_direction(
         self, kick_direction: float,
     ) -> tuple[float, float]:
@@ -944,7 +887,7 @@ class Player:
             )
 
     def defensive_press_and_clear(self) -> None:
-        """快速低力度抢断；己方禁区内仅增加简单球后侧安全判断。"""
+        """在全场直接追球，并使用低力度快速抢断。"""
         self._set_ball_handling_role("defensive_presser")
         self._reset_ball_approach()
         context = self.context
@@ -956,28 +899,6 @@ class Player:
             return
 
         ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
-        ball_in_own_penalty_area = self._ball_is_in_own_penalty_area()
-        safe_for_penalty_tackle = (
-            not ball_in_own_penalty_area
-            or self._is_behind_ball_for_penalty_tackle()
-        )
-        if not safe_for_penalty_tackle:
-            self.release_kick()
-            reposition_target = self._get_penalty_tackle_reposition_target()
-            if reposition_target is None:
-                self.action = "defensive_presser:no_ball"
-                self.stop()
-                return
-            self.walk_to(
-                reposition_target,
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=False,
-                preserve_ball_handling_role=True,
-            )
-            self.action = "defensive_presser:penalty_reposition"
-            return
-
         tackle_distance_limit = (
             DEFENSIVE_PRESSER_TACKLE_EXIT_DISTANCE_M
             if self._kicking
