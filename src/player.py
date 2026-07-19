@@ -128,6 +128,11 @@ class Player:
         self._ball_approach_last_progress_at: float | None = None
         self._ball_approach_direct_until: float = 0.0
 
+        # 定向重启踢球独立锁定世界目标、方向和力度，不复用普通射门规划。
+        self._directed_restart_target: tuple[float, float] | None = None
+        self._directed_restart_direction: float | None = None
+        self._directed_restart_power: float | None = None
+
         # block/guard 的跨帧迟滞状态
         self._block_pressing: bool = False
         self._guard_threatened: bool = False
@@ -388,10 +393,57 @@ class Player:
 
     def release_kick(self) -> None:
         self._kicking = False  # 清除踢球迟滞标志(取消方块显示)
+        self._reset_directed_restart_kick()
         if self._backend is None:
             _log.debug("player %d release_kick (no backend)", self.id)
             return
         self._backend.release_kick()
+
+
+    def _reset_directed_restart_kick(self) -> None:
+        self._directed_restart_target = None
+        self._directed_restart_direction = None
+        self._directed_restart_power = None
+
+    def directed_restart_kick(
+        self,
+        kick_target: tuple[float, float],
+        power: float,
+    ) -> None:
+        """朝锁定世界目标执行重启踢球，不经过普通射门或解围规划。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None or self.pose is None:
+            self.reset_ball_handling_state()
+            return
+        if not all(math.isfinite(value) for value in (*kick_target, power)):
+            self.reset_ball_handling_state()
+            return
+
+        self._set_ball_handling_role("directed_restart")
+        if self._directed_restart_target is None:
+            self._directed_restart_target = kick_target
+            self._directed_restart_direction = angle_to(
+                ball.x,
+                ball.y,
+                kick_target[0],
+                kick_target[1],
+            )
+            self._directed_restart_power = power
+
+        locked_direction = self._directed_restart_direction
+        locked_power = self._directed_restart_power
+        locked_target = self._directed_restart_target
+        if (
+            locked_direction is None
+            or locked_power is None
+            or locked_target is None
+        ):
+            self.reset_ball_handling_state()
+            return
+
+        self._draw_kick_target(locked_target)
+        self.kick(locked_direction, locked_power)
 
     def kick_can_score(self, kick_direction: float) -> bool:
         """判断从当前球位按 ``kick_direction`` 踢,直线轨迹是否能进对方球门。

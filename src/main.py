@@ -28,6 +28,7 @@ from .utils import (
     angle_to,
     clamp,
     dist,
+    normalize_angle,
     opponent_goal,
     own_goal,
     own_goal_area_center,
@@ -72,6 +73,25 @@ class GoalkeeperMode(Enum):
     RETURN = "return"
 
 
+class ThrowInRegion(Enum):
+    """按场地长度比例划分的界外球区域。"""
+
+    BACKFIELD = "backfield"
+    MIDFIELD = "midfield"
+    FRONTFIELD = "frontfield"
+
+
+class ThrowInStage(Enum):
+    """我方界外球固定战术执行阶段。"""
+
+    POSITIONING = "positioning"
+    KICKING = "kicking"
+    PASS_IN_FLIGHT = "pass_in_flight"
+    FOLLOW_UP = "follow_up"
+    COMPLETE = "complete"
+    ABORTED = "aborted"
+
+
 class OpenPlayAvailability(Enum):
     """普通比赛角色分配可使用的机器人数量。"""
 
@@ -114,6 +134,40 @@ class GoalkeeperThreatEstimate:
     position_threat: bool
     projected_goal_y: float | None
     reason: str
+
+
+@dataclass(frozen=True)
+class ThrowInRoleAssignment:
+    """一次界外球上下文中只选择一次的固定职责。"""
+
+    goalkeeper_id: int | None
+    kicker_id: int | None
+    receiver_id: int | None
+    available_player_ids_at_entry: tuple[int, ...]
+
+
+@dataclass
+class ThrowInTacticState:
+    """我方界外球固定战术的锁定几何和执行进度。"""
+
+    stage: ThrowInStage
+    region: ThrowInRegion
+    started_at: float
+    stage_started_at: float
+    origin: tuple[float, float]
+    infield_y_direction: float
+    long_clearance: bool
+    pass_target: tuple[float, float]
+    receiver_target: tuple[float, float] | None
+    kicker_stage_target: tuple[float, float]
+    pass_direction: tuple[float, float]
+    pass_power: float
+    kick_command_started: bool = False
+    kicking_start_ball_position: tuple[float, float] | None = None
+    follow_up_start_ball_position: tuple[float, float] | None = None
+    follow_up_target: tuple[float, float] | None = None
+    follow_up_action_started: bool = False
+    terminal_reason: str | None = None
 
 
 @dataclass
@@ -257,6 +311,10 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.active_tactic = None
         store.locked_roles = None
         store.tactic_roles = None
+        store.throw_in_state = None
+        store.throw_in_context_consumed = False
+        store.throw_in_last_outcome = None
+        store.throw_in_last_reason = None
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -299,6 +357,12 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         )
         if current_goalkeeper is None or store.prev_phase != phase:
             _reset_goalkeeper_strategy(store)
+
+        _synchronize_throw_in_tactic_context(
+            context,
+            players,
+            store,
+        )
 
         # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
         if phase == Phase.NORMAL:
@@ -767,6 +831,12 @@ def _inactivity_override_is_protected(
 ) -> bool:
     """不覆盖主罚、追球、踢球和守门员紧急响应。"""
     if player.is_kicking:
+        return True
+    locked_tactic_roles = getattr(store, "locked_roles", None) or frozenset()
+    if (
+        getattr(store, "active_tactic", None) == "throw_in"
+        and player.id in locked_tactic_roles
+    ):
         return True
     if (
         phase == Phase.OUR_KICKOFF
@@ -3081,6 +3151,1493 @@ def _act_opp_kickoff(
         )
 
 
+def _is_our_throw_in_context(context: Context) -> bool:
+    """仅接受 GameController 明确报告的可执行我方界外球。"""
+    game = context.game
+    return (
+        game is not None
+        and game.state == GameState.PLAYING
+        and not game.stopped
+        and game.set_play == SetPlay.THROW_IN
+        and game.kicking_team == context.team_id
+    )
+
+
+def _finish_throw_in_tactic(
+    players: list[Player],
+    store,
+    outcome: ThrowInStage,
+    reason: str,
+) -> None:
+    """释放固定职责，同时保留当前连续界外球上下文的消费锁存。"""
+    state = getattr(store, "throw_in_state", None)
+    if state is not None:
+        state.stage = outcome
+        state.terminal_reason = reason
+
+    locked_player_ids = getattr(store, "locked_roles", None) or frozenset()
+    for player in players:
+        if player.id not in locked_player_ids:
+            continue
+        player.stop()
+        player.action = f"throw_in:{outcome.value}:{reason}"
+
+    store.active_tactic = None
+    store.locked_roles = None
+    store.tactic_roles = None
+    store.throw_in_state = None
+    store.throw_in_context_consumed = True
+    store.throw_in_last_outcome = outcome.value
+    store.throw_in_last_reason = reason
+    _log.info("throw-in tactic %s reason=%s", outcome.value, reason)
+
+
+def _consume_throw_in_context_without_tactic(store, reason: str) -> None:
+    """人数或观测不足时消费当前上下文，禁止随后重新初始化。"""
+    store.active_tactic = None
+    store.locked_roles = None
+    store.tactic_roles = None
+    store.throw_in_state = None
+    store.throw_in_context_consumed = True
+    store.throw_in_last_outcome = ThrowInStage.ABORTED.value
+    store.throw_in_last_reason = reason
+
+
+def _synchronize_throw_in_tactic_context(
+    context: Context,
+    players: list[Player],
+    store,
+) -> None:
+    """裁判上下文变化时终止固定战术，并只在明确离开后解锁新事件。"""
+    our_throw_in_context = _is_our_throw_in_context(context)
+    if (
+        getattr(store, "active_tactic", None) == "throw_in"
+        and not our_throw_in_context
+    ):
+        reason = (
+            "game_controller_unavailable"
+            if context.game is None
+            else "game_context_changed"
+        )
+        _finish_throw_in_tactic(
+            players,
+            store,
+            ThrowInStage.ABORTED,
+            reason,
+        )
+
+    # 暂时收不到裁判数据时保留 consumed，避免同一上下文恢复后重跑。
+    if context.game is not None and not our_throw_in_context:
+        store.throw_in_context_consumed = False
+
+
+def _classify_throw_in_region(context: Context, origin_x: float) -> ThrowInRegion:
+    half_length = max(context.field.length / 2.0, 1e-6)
+    normalized_x = origin_x / half_length
+    if normalized_x <= THROW_IN_BACKFIELD_MAX_X_RATIO:
+        return ThrowInRegion.BACKFIELD
+    if normalized_x >= THROW_IN_FRONTFIELD_MIN_X_RATIO:
+        return ThrowInRegion.FRONTFIELD
+    return ThrowInRegion.MIDFIELD
+
+
+def _get_valid_opponent_positions(context: Context) -> list[tuple[float, float]]:
+    return [
+        (opponent.pose.x, opponent.pose.y)
+        for opponent in context.opponents.values()
+        if opponent.pose is not None
+    ]
+
+
+def _get_throw_in_lane_clearance(
+    opponent_positions: list[tuple[float, float]],
+    origin: tuple[float, float],
+    target: tuple[float, float],
+) -> float:
+    segment_delta_x = target[0] - origin[0]
+    segment_delta_y = target[1] - origin[1]
+    segment_length_squared = (
+        segment_delta_x * segment_delta_x
+        + segment_delta_y * segment_delta_y
+    )
+    minimum_clearance = math.inf
+    for opponent_x, opponent_y in opponent_positions:
+        if segment_length_squared <= 1e-12:
+            line_distance = dist(
+                opponent_x,
+                opponent_y,
+                origin[0],
+                origin[1],
+            )
+        else:
+            projection = clamp(
+                (
+                    (opponent_x - origin[0]) * segment_delta_x
+                    + (opponent_y - origin[1]) * segment_delta_y
+                ) / segment_length_squared,
+                0.0,
+                1.0,
+            )
+            nearest_x = origin[0] + segment_delta_x * projection
+            nearest_y = origin[1] + segment_delta_y * projection
+            line_distance = dist(
+                opponent_x,
+                opponent_y,
+                nearest_x,
+                nearest_y,
+            )
+        minimum_clearance = min(minimum_clearance, line_distance)
+    return minimum_clearance
+
+
+def _get_throw_in_target_clearance(
+    opponent_positions: list[tuple[float, float]],
+    target: tuple[float, float],
+) -> float:
+    return min(
+        (
+            dist(target[0], target[1], opponent_x, opponent_y)
+            for opponent_x, opponent_y in opponent_positions
+        ),
+        default=math.inf,
+    )
+
+
+def _constrain_throw_in_target(
+    context: Context,
+    origin: tuple[float, float],
+    infield_y_direction: float,
+    preferred_target: tuple[float, float],
+) -> tuple[float, float] | None:
+    """约束候选后重新检查向前、向内，拒绝 clamp 造成的退化。"""
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    target = (
+        clamp(preferred_target[0], -half_length, half_length),
+        clamp(preferred_target[1], -half_width, half_width),
+    )
+    forward_progress = target[0] - origin[0]
+    infield_progress = (target[1] - origin[1]) * infield_y_direction
+    if (
+        forward_progress < THROW_IN_MIN_FORWARD_PROGRESS_M
+        or infield_progress < THROW_IN_MIN_INFIELD_PROGRESS_M
+    ):
+        return None
+    return target
+
+
+def _throw_in_line_crosses_own_goal_front(
+    context: Context,
+    origin: tuple[float, float],
+    target: tuple[float, float],
+) -> bool:
+    """判断向前线路是否进入己方球门正前方保护矩形。"""
+    own_goal_line_x = -context.field.length / 2.0
+    protected_front_x = own_goal_line_x + THROW_IN_OWN_GOAL_FRONT_DEPTH_M
+    if origin[0] > protected_front_x:
+        return False
+
+    segment_delta_x = target[0] - origin[0]
+    if segment_delta_x <= 1e-6:
+        return True
+    protected_end_ratio = clamp(
+        (protected_front_x - origin[0]) / segment_delta_x,
+        0.0,
+        1.0,
+    )
+    protected_end_y = origin[1] + (
+        target[1] - origin[1]
+    ) * protected_end_ratio
+    protected_half_width = (
+        context.field.goal_width / 2.0
+        + THROW_IN_OWN_GOAL_FRONT_LATERAL_MARGIN_M
+    )
+    minimum_y = min(origin[1], protected_end_y)
+    maximum_y = max(origin[1], protected_end_y)
+    return (
+        minimum_y <= protected_half_width
+        and maximum_y >= -protected_half_width
+    )
+
+
+def _get_throw_in_region_offsets(
+    region: ThrowInRegion,
+) -> tuple[float, float]:
+    if region == ThrowInRegion.BACKFIELD:
+        return (
+            THROW_IN_BACKFIELD_FORWARD_OFFSET_M,
+            THROW_IN_BACKFIELD_INFIELD_OFFSET_M,
+        )
+    if region == ThrowInRegion.FRONTFIELD:
+        return (
+            THROW_IN_FRONTFIELD_FORWARD_OFFSET_M,
+            THROW_IN_FRONTFIELD_INFIELD_OFFSET_M,
+        )
+    return (
+        THROW_IN_MIDFIELD_FORWARD_OFFSET_M,
+        THROW_IN_MIDFIELD_INFIELD_OFFSET_M,
+    )
+
+
+def _select_throw_in_short_pass_target(
+    context: Context,
+    origin: tuple[float, float],
+    infield_y_direction: float,
+    region: ThrowInRegion,
+    receiver: Player | None,
+    opponent_positions: list[tuple[float, float]],
+) -> tuple[float, float] | None:
+    forward_offset, infield_offset = _get_throw_in_region_offsets(region)
+    offset_candidates = [
+        (forward_offset, infield_offset),
+        (forward_offset * 0.85, infield_offset * 1.25),
+        (forward_offset * 1.20, infield_offset * 0.90),
+    ]
+    if receiver is not None and receiver.pose is not None:
+        receiver_forward_offset = max(
+            forward_offset * 0.75,
+            receiver.pose.x - origin[0] + THROW_IN_RECEIVER_TRAIL_DISTANCE_M,
+        )
+        receiver_infield_offset = max(
+            infield_offset * 0.75,
+            (receiver.pose.y - origin[1]) * infield_y_direction
+            + THROW_IN_RECEIVER_TRAIL_DISTANCE_M,
+        )
+        offset_candidates.append(
+            (receiver_forward_offset, receiver_infield_offset),
+        )
+
+    ranked_candidates: list[
+        tuple[float, float, float, float, tuple[float, float]]
+    ] = []
+    for candidate_forward, candidate_infield in offset_candidates:
+        candidate = _constrain_throw_in_target(
+            context,
+            origin,
+            infield_y_direction,
+            (
+                origin[0] + candidate_forward,
+                origin[1] + infield_y_direction * candidate_infield,
+            ),
+        )
+        if candidate is None:
+            continue
+        if (
+            region == ThrowInRegion.BACKFIELD
+            and _throw_in_line_crosses_own_goal_front(
+                context,
+                origin,
+                candidate,
+            )
+        ):
+            continue
+
+        lane_clearance = _get_throw_in_lane_clearance(
+            opponent_positions,
+            origin,
+            candidate,
+        )
+        target_clearance = _get_throw_in_target_clearance(
+            opponent_positions,
+            candidate,
+        )
+        if (
+            lane_clearance < THROW_IN_SHORT_PASS_LANE_CLEARANCE_M
+            or target_clearance < THROW_IN_TARGET_OPPONENT_CLEARANCE_M
+        ):
+            continue
+        receiver_distance = (
+            dist(
+                receiver.pose.x,
+                receiver.pose.y,
+                candidate[0],
+                candidate[1],
+            )
+            if receiver is not None and receiver.pose is not None
+            else 0.0
+        )
+        ranked_candidates.append(
+            (
+                lane_clearance,
+                target_clearance,
+                -receiver_distance,
+                candidate[0] - origin[0],
+                candidate,
+            ),
+        )
+
+    if not ranked_candidates:
+        return None
+    return max(ranked_candidates, key=lambda item: item[:4])[4]
+
+
+def _build_throw_in_long_clearance_target(
+    context: Context,
+    origin: tuple[float, float],
+    infield_y_direction: float,
+) -> tuple[float, float] | None:
+    candidates = (
+        (
+            origin[0] + THROW_IN_BACKFIELD_LONG_DISTANCE_M,
+            origin[1]
+            + infield_y_direction * THROW_IN_BACKFIELD_LONG_INFIELD_M,
+        ),
+        (
+            origin[0] + THROW_IN_BACKFIELD_LONG_DISTANCE_M * 0.90,
+            origin[1]
+            + infield_y_direction * THROW_IN_BACKFIELD_LONG_INFIELD_M * 1.20,
+        ),
+    )
+    opponent_positions = _get_valid_opponent_positions(context)
+    ranked_candidates: list[
+        tuple[float, float, float, tuple[float, float]]
+    ] = []
+    for preferred_target in candidates:
+        target = _constrain_throw_in_target(
+            context,
+            origin,
+            infield_y_direction,
+            preferred_target,
+        )
+        if target is None:
+            continue
+        if _throw_in_line_crosses_own_goal_front(context, origin, target):
+            continue
+        ranked_candidates.append(
+            (
+                _get_throw_in_lane_clearance(
+                    opponent_positions,
+                    origin,
+                    target,
+                ),
+                _get_throw_in_target_clearance(
+                    opponent_positions,
+                    target,
+                ),
+                target[0] - origin[0],
+                target,
+            ),
+        )
+    if not ranked_candidates:
+        return None
+    return max(ranked_candidates, key=lambda item: item[:3])[3]
+
+
+def _throw_in_backfield_requires_long_clearance(
+    context: Context,
+    origin: tuple[float, float],
+    kicker: Player,
+    short_target: tuple[float, float] | None,
+) -> bool:
+    opponent_positions = _get_valid_opponent_positions(context)
+    if not opponent_positions or short_target is None:
+        return True
+
+    origin_pressure = min(
+        dist(origin[0], origin[1], opponent_x, opponent_y)
+        for opponent_x, opponent_y in opponent_positions
+    )
+    kicker_pressure = min(
+        dist(
+            kicker.pose.x,
+            kicker.pose.y,
+            opponent_x,
+            opponent_y,
+        )
+        for opponent_x, opponent_y in opponent_positions
+    )
+    lane_clearance = _get_throw_in_lane_clearance(
+        opponent_positions,
+        origin,
+        short_target,
+    )
+    return (
+        origin_pressure <= THROW_IN_PRESSURE_DISTANCE_M
+        or kicker_pressure <= THROW_IN_PRESSURE_DISTANCE_M
+        or lane_clearance <= THROW_IN_PRESSURE_LANE_CLEARANCE_M
+    )
+
+
+def _get_throw_in_short_pass_power(pass_distance: float) -> float:
+    distance_span = (
+        THROW_IN_SHORT_PASS_FAR_DISTANCE_M
+        - THROW_IN_SHORT_PASS_NEAR_DISTANCE_M
+    )
+    if distance_span <= 1e-6:
+        return THROW_IN_SHORT_PASS_POWER_MIN
+    interpolation_ratio = clamp(
+        (
+            pass_distance - THROW_IN_SHORT_PASS_NEAR_DISTANCE_M
+        ) / distance_span,
+        0.0,
+        1.0,
+    )
+    return (
+        THROW_IN_SHORT_PASS_POWER_MIN
+        + (
+            THROW_IN_SHORT_PASS_POWER_MAX
+            - THROW_IN_SHORT_PASS_POWER_MIN
+        ) * interpolation_ratio
+    )
+
+
+def _get_throw_in_receiver_target(
+    context: Context,
+    pass_target: tuple[float, float],
+    pass_direction: tuple[float, float],
+) -> tuple[float, float]:
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    return (
+        clamp(
+            pass_target[0]
+            - pass_direction[0] * THROW_IN_RECEIVER_TRAIL_DISTANCE_M,
+            -half_length,
+            half_length,
+        ),
+        clamp(
+            pass_target[1]
+            - pass_direction[1] * THROW_IN_RECEIVER_TRAIL_DISTANCE_M,
+            -half_width,
+            half_width,
+        ),
+    )
+
+
+def _select_throw_in_kicker_stage_target(
+    context: Context,
+    origin: tuple[float, float],
+    infield_y_direction: float,
+    pass_direction: tuple[float, float],
+    kicker: Player,
+) -> tuple[float, float] | None:
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    preferred_candidates = (
+        (
+            origin[0]
+            - pass_direction[0] * THROW_IN_KICKER_STAGE_DISTANCE_M,
+            origin[1]
+            - pass_direction[1] * THROW_IN_KICKER_STAGE_DISTANCE_M,
+        ),
+        (
+            origin[0]
+            - pass_direction[0] * THROW_IN_KICKER_STAGE_DISTANCE_M * 0.65,
+            origin[1]
+            + infield_y_direction * THROW_IN_KICKER_STAGE_INFIELD_M,
+        ),
+        (
+            origin[0]
+            - pass_direction[0] * THROW_IN_KICKER_STAGE_DISTANCE_M * 0.25,
+            origin[1]
+            + infield_y_direction * THROW_IN_KICKER_STAGE_INFIELD_M * 1.15,
+        ),
+    )
+    legal_candidates: list[tuple[float, float]] = []
+    for preferred_target in preferred_candidates:
+        target = (
+            clamp(preferred_target[0], -half_length, half_length),
+            clamp(preferred_target[1], -half_width, half_width),
+        )
+        target_ball_distance = dist(
+            target[0],
+            target[1],
+            origin[0],
+            origin[1],
+        )
+        if target_ball_distance < THROW_IN_KICKER_STAGE_DISTANCE_M * 0.65:
+            continue
+        legal_candidates.append(target)
+
+    if not legal_candidates or kicker.pose is None:
+        return None
+    return min(
+        legal_candidates,
+        key=lambda target: dist(
+            kicker.pose.x,
+            kicker.pose.y,
+            target[0],
+            target[1],
+        ),
+    )
+
+
+def _build_throw_in_plan(
+    context: Context,
+    kicker: Player,
+    receiver: Player | None,
+) -> tuple[ThrowInTacticState | None, str | None]:
+    ball = context.ball
+    if ball is None:
+        return None, "ball_unavailable"
+
+    origin = (ball.x, ball.y)
+    half_width = context.field.width / 2.0
+    touchline_distance = abs(half_width - abs(origin[1]))
+    if touchline_distance > THROW_IN_TOUCHLINE_TOLERANCE_M:
+        return None, "ball_not_near_touchline"
+
+    infield_y_direction = -1.0 if origin[1] >= 0.0 else 1.0
+    region = _classify_throw_in_region(context, origin[0])
+    opponent_positions = _get_valid_opponent_positions(context)
+    short_target = _select_throw_in_short_pass_target(
+        context,
+        origin,
+        infield_y_direction,
+        region,
+        receiver,
+        opponent_positions,
+    )
+    long_clearance = (
+        region == ThrowInRegion.BACKFIELD
+        and _throw_in_backfield_requires_long_clearance(
+            context,
+            origin,
+            kicker,
+            short_target,
+        )
+    )
+    if long_clearance:
+        pass_target = _build_throw_in_long_clearance_target(
+            context,
+            origin,
+            infield_y_direction,
+        )
+    else:
+        pass_target = short_target
+    if pass_target is None:
+        return None, "no_valid_pass_target"
+
+    pass_delta_x = pass_target[0] - origin[0]
+    pass_delta_y = pass_target[1] - origin[1]
+    pass_distance = math.hypot(pass_delta_x, pass_delta_y)
+    if pass_distance <= 1e-6:
+        return None, "degenerate_pass_target"
+    pass_direction = (
+        pass_delta_x / pass_distance,
+        pass_delta_y / pass_distance,
+    )
+    kicker_stage_target = _select_throw_in_kicker_stage_target(
+        context,
+        origin,
+        infield_y_direction,
+        pass_direction,
+        kicker,
+    )
+    if kicker_stage_target is None:
+        return None, "no_valid_kicker_stage"
+
+    receiver_target = (
+        _get_throw_in_receiver_target(
+            context,
+            pass_target,
+            pass_direction,
+        )
+        if receiver is not None
+        else None
+    )
+    pass_power = (
+        THROW_IN_BACKFIELD_LONG_KICK_POWER
+        if long_clearance
+        else _get_throw_in_short_pass_power(pass_distance)
+    )
+    return (
+        ThrowInTacticState(
+            stage=ThrowInStage.POSITIONING,
+            region=region,
+            started_at=context.now,
+            stage_started_at=context.now,
+            origin=origin,
+            infield_y_direction=infield_y_direction,
+            long_clearance=long_clearance,
+            pass_target=pass_target,
+            receiver_target=receiver_target,
+            kicker_stage_target=kicker_stage_target,
+            pass_direction=pass_direction,
+            pass_power=pass_power,
+        ),
+        None,
+    )
+
+
+def _draw_throw_in_plan(state: ThrowInTacticState) -> None:
+    from .framework import debugdraw
+
+    debugdraw.point(
+        state.origin[0],
+        state.origin[1],
+        rgb=(1.0, 0.8, 0.0),
+        scale=0.18,
+        ns="throw_in_origin",
+    )
+    debugdraw.line(
+        [state.origin, state.pass_target],
+        rgb=(0.2, 1.0, 0.4),
+        ns="throw_in_pass",
+    )
+    debugdraw.point(
+        state.pass_target[0],
+        state.pass_target[1],
+        rgb=(0.2, 1.0, 0.4),
+        scale=0.18,
+        ns="throw_in_pass_target",
+    )
+    debugdraw.point(
+        state.kicker_stage_target[0],
+        state.kicker_stage_target[1],
+        rgb=(1.0, 0.4, 0.1),
+        scale=0.16,
+        ns="throw_in_kicker_stage",
+    )
+    if state.receiver_target is not None:
+        debugdraw.point(
+            state.receiver_target[0],
+            state.receiver_target[1],
+            rgb=(0.2, 0.7, 1.0),
+            scale=0.16,
+            ns="throw_in_receiver_target",
+        )
+
+
+def _get_throw_in_roles(
+    players: list[Player],
+    goalkeeper: Player | None,
+    roles: ThrowInRoleAssignment,
+) -> tuple[Player | None, Player | None, Player | None, str | None]:
+    available_by_id = {player.id: player for player in players}
+    current_goalkeeper_id = goalkeeper.id if goalkeeper is not None else None
+    if roles.goalkeeper_id != current_goalkeeper_id:
+        return None, None, None, "goalkeeper_changed"
+
+    locked_goalkeeper = available_by_id.get(roles.goalkeeper_id)
+    kicker = available_by_id.get(roles.kicker_id)
+    receiver = available_by_id.get(roles.receiver_id)
+    if roles.kicker_id is not None and kicker is None:
+        return locked_goalkeeper, None, receiver, "kicker_unavailable"
+    if roles.receiver_id is not None and receiver is None:
+        return locked_goalkeeper, kicker, None, "receiver_unavailable"
+    if roles.goalkeeper_id is not None and locked_goalkeeper is None:
+        return None, kicker, receiver, "goalkeeper_unavailable"
+    return locked_goalkeeper, kicker, receiver, None
+
+
+def _guard_throw_in_goalkeeper(
+    context: Context,
+    goalkeeper: Player | None,
+    field_players: list[Player],
+    store,
+) -> None:
+    if goalkeeper is None:
+        return
+    _act_goalkeeper_guard(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+        allow_active_response=False,
+    )
+    goalkeeper.action = "throw_in:goalkeeper:hold"
+
+
+def _get_throw_in_ball_progress(
+    state: ThrowInTacticState,
+    ball_x: float,
+    ball_y: float,
+) -> tuple[float, float, float]:
+    movement_x = ball_x - state.origin[0]
+    movement_y = ball_y - state.origin[1]
+    movement_distance = math.hypot(movement_x, movement_y)
+    forward_progress = (
+        movement_x * state.pass_direction[0]
+        + movement_y * state.pass_direction[1]
+    )
+    lateral_deviation = abs(
+        movement_x * state.pass_direction[1]
+        - movement_y * state.pass_direction[0]
+    )
+    return movement_distance, forward_progress, lateral_deviation
+
+
+def _get_throw_in_rear_support_target(
+    context: Context,
+    state: ThrowInTacticState,
+    receiver: Player | None,
+) -> tuple[float, float]:
+    ball = context.ball
+    if receiver is not None and receiver.pose is not None:
+        reference_x, reference_y = receiver.pose.x, receiver.pose.y
+    elif ball is not None:
+        reference_x, reference_y = ball.x, ball.y
+    else:
+        reference_x, reference_y = state.pass_target
+
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    return (
+        clamp(
+            reference_x - THROW_IN_REAR_SUPPORT_DISTANCE_M,
+            -half_length,
+            half_length,
+        ),
+        clamp(
+            reference_y
+            + state.infield_y_direction * THROW_IN_REAR_SUPPORT_INFIELD_M,
+            -half_width,
+            half_width,
+        ),
+    )
+
+
+def _move_throw_in_receiver_to_target(
+    context: Context,
+    receiver: Player,
+    target: tuple[float, float],
+    action: str,
+    *,
+    avoid_ball: bool,
+) -> None:
+    ball = context.ball
+    face = (
+        angle_to(receiver.pose.x, receiver.pose.y, ball.x, ball.y)
+        if ball is not None and receiver.pose is not None
+        else None
+    )
+    receiver.walk_to(
+        target,
+        face=face,
+        avoid_ball=avoid_ball,
+        avoid_robots=True,
+        arrive_dist=THROW_IN_RECEIVER_READY_DISTANCE_M,
+    )
+    receiver.action = action
+
+
+def _abort_throw_in(
+    players: list[Player],
+    store,
+    reason: str,
+) -> None:
+    _finish_throw_in_tactic(
+        players,
+        store,
+        ThrowInStage.ABORTED,
+        reason,
+    )
+
+
+def _upgrade_throw_in_to_long_clearance(
+    context: Context,
+    state: ThrowInTacticState,
+    kicker: Player,
+) -> bool:
+    long_target = _build_throw_in_long_clearance_target(
+        context,
+        state.origin,
+        state.infield_y_direction,
+    )
+    if long_target is None:
+        return False
+    delta_x = long_target[0] - state.origin[0]
+    delta_y = long_target[1] - state.origin[1]
+    target_distance = math.hypot(delta_x, delta_y)
+    if target_distance <= 1e-6:
+        return False
+    pass_direction = (delta_x / target_distance, delta_y / target_distance)
+    stage_target = _select_throw_in_kicker_stage_target(
+        context,
+        state.origin,
+        state.infield_y_direction,
+        pass_direction,
+        kicker,
+    )
+    if stage_target is None:
+        return False
+
+    state.long_clearance = True
+    state.pass_target = long_target
+    state.pass_direction = pass_direction
+    state.pass_power = THROW_IN_BACKFIELD_LONG_KICK_POWER
+    state.kicker_stage_target = stage_target
+    state.receiver_target = _get_throw_in_receiver_target(
+        context,
+        long_target,
+        pass_direction,
+    )
+    return True
+
+
+def _act_throw_in_positioning(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    kicker: Player,
+    receiver: Player | None,
+    state: ThrowInTacticState,
+    store,
+) -> None:
+    ball = context.ball
+    if ball is None:
+        _abort_throw_in(players, store, "ball_unavailable")
+        return
+    if (
+        dist(ball.x, ball.y, state.origin[0], state.origin[1])
+        > THROW_IN_BALL_ORIGIN_TOLERANCE_M
+    ):
+        _abort_throw_in(players, store, "ball_moved_before_kick")
+        return
+    if (
+        context.now - state.stage_started_at
+        >= THROW_IN_POSITIONING_TIMEOUT_SEC
+    ):
+        _abort_throw_in(players, store, "positioning_timeout")
+        return
+
+    if (
+        state.region == ThrowInRegion.BACKFIELD
+        and not state.long_clearance
+        and _throw_in_backfield_requires_long_clearance(
+            context,
+            state.origin,
+            kicker,
+            state.pass_target,
+        )
+    ):
+        if not _upgrade_throw_in_to_long_clearance(context, state, kicker):
+            _abort_throw_in(players, store, "long_clearance_unavailable")
+            return
+
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+
+    kick_direction = angle_to(
+        state.origin[0],
+        state.origin[1],
+        state.pass_target[0],
+        state.pass_target[1],
+    )
+    kicker.walk_to(
+        state.kicker_stage_target,
+        face=kick_direction,
+        avoid_ball=True,
+        avoid_robots=True,
+        arrive_dist=THROW_IN_KICKER_READY_DISTANCE_M,
+    )
+    kicker_position_ready = dist(
+        kicker.pose.x,
+        kicker.pose.y,
+        state.kicker_stage_target[0],
+        state.kicker_stage_target[1],
+    ) <= THROW_IN_KICKER_READY_DISTANCE_M
+    kicker_heading_ready = abs(normalize_angle(
+        kick_direction - kicker.pose.theta,
+    )) <= THROW_IN_KICKER_READY_HEADING_RAD
+
+    receiver_ready = receiver is None or state.long_clearance
+    if receiver is not None and state.receiver_target is not None:
+        _move_throw_in_receiver_to_target(
+            context,
+            receiver,
+            state.receiver_target,
+            "throw_in:receiver:position",
+            avoid_ball=True,
+        )
+        receiver_ready = (
+            state.long_clearance
+            or dist(
+                receiver.pose.x,
+                receiver.pose.y,
+                state.receiver_target[0],
+                state.receiver_target[1],
+            ) <= THROW_IN_RECEIVER_READY_DISTANCE_M
+        )
+
+    solo = receiver is None
+    if kicker_position_ready and kicker_heading_ready and receiver_ready:
+        kicker.action = (
+            "throw_in:solo:position"
+            if solo
+            else "throw_in:kicker:wait"
+        )
+        state.stage = ThrowInStage.KICKING
+        state.stage_started_at = context.now
+        state.kicking_start_ball_position = (ball.x, ball.y)
+        return
+    kicker.action = (
+        "throw_in:solo:position"
+        if solo
+        else "throw_in:kicker:position"
+    )
+
+
+def _act_throw_in_kicking(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    kicker: Player,
+    receiver: Player | None,
+    state: ThrowInTacticState,
+    store,
+) -> None:
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+    if receiver is not None and state.receiver_target is not None:
+        _move_throw_in_receiver_to_target(
+            context,
+            receiver,
+            state.receiver_target,
+            "throw_in:receiver:position",
+            avoid_ball=True,
+        )
+
+    ball = context.ball
+    if ball is None:
+        _abort_throw_in(players, store, "ball_unavailable")
+        return
+    movement, progress, lateral_deviation = _get_throw_in_ball_progress(
+        state,
+        ball.x,
+        ball.y,
+    )
+    if not state.kick_command_started:
+        if movement > THROW_IN_BALL_ORIGIN_TOLERANCE_M:
+            _abort_throw_in(players, store, "ball_moved_before_kick")
+            return
+        kicker.directed_restart_kick(state.pass_target, state.pass_power)
+        state.kick_command_started = True
+        if state.long_clearance:
+            kicker.action = (
+                "throw_in:solo:clear"
+                if receiver is None
+                else "throw_in:kicker:clear"
+            )
+        elif receiver is None:
+            kicker.action = "throw_in:solo:pass"
+        else:
+            kicker.action = "throw_in:kicker:pass"
+        return
+    if (
+        movement >= THROW_IN_BALL_START_CONFIRM_DISTANCE_M
+        and progress <= THROW_IN_WRONG_DIRECTION_PROGRESS_M
+    ):
+        _abort_throw_in(players, store, "ball_moved_wrong_direction")
+        return
+    if (
+        movement >= THROW_IN_BALL_START_CONFIRM_DISTANCE_M
+        and lateral_deviation
+        > THROW_IN_PASS_SEVERE_LATERAL_TOLERANCE_M
+    ):
+        _abort_throw_in(players, store, "initial_pass_severely_deviated")
+        return
+    if (
+        progress >= THROW_IN_BALL_START_CONFIRM_DISTANCE_M
+        and lateral_deviation <= THROW_IN_PASS_LATERAL_TOLERANCE_M
+    ):
+        kicker.stop()
+        if receiver is None or state.long_clearance:
+            _finish_throw_in_tactic(
+                players,
+                store,
+                ThrowInStage.COMPLETE,
+                "restart_kick_confirmed",
+            )
+            return
+        state.stage = ThrowInStage.PASS_IN_FLIGHT
+        state.stage_started_at = context.now
+        return
+    if context.now - state.stage_started_at >= THROW_IN_KICKING_TIMEOUT_SEC:
+        _abort_throw_in(players, store, "kick_no_expected_movement")
+        return
+
+    kicker.directed_restart_kick(state.pass_target, state.pass_power)
+    if state.long_clearance:
+        kicker.action = (
+            "throw_in:solo:clear"
+            if receiver is None
+            else "throw_in:kicker:clear"
+        )
+    elif receiver is None:
+        kicker.action = "throw_in:solo:pass"
+    else:
+        kicker.action = "throw_in:kicker:pass"
+
+
+def _opponent_has_throw_in_arrival_advantage(
+    context: Context,
+    receiver: Player,
+) -> bool:
+    ball = context.ball
+    if ball is None or receiver.pose is None:
+        return False
+    opponent_ball_distance = min(
+        (
+            dist(
+                opponent.pose.x,
+                opponent.pose.y,
+                ball.x,
+                ball.y,
+            )
+            for opponent in context.opponents.values()
+            if opponent.pose is not None
+        ),
+        default=math.inf,
+    )
+    receiver_ball_distance = dist(
+        receiver.pose.x,
+        receiver.pose.y,
+        ball.x,
+        ball.y,
+    )
+    return (
+        opponent_ball_distance <= THROW_IN_OPPONENT_BALL_DISTANCE_M
+        and opponent_ball_distance + THROW_IN_OPPONENT_ARRIVAL_ADVANTAGE_M
+        < receiver_ball_distance
+    )
+
+
+def _build_throw_in_follow_up_target(
+    context: Context,
+    state: ThrowInTacticState,
+) -> tuple[float, float] | None:
+    ball = context.ball
+    if ball is None:
+        return None
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - THROW_IN_FIELD_MARGIN_M,
+    )
+    target = (
+        clamp(
+            ball.x + THROW_IN_FOLLOW_UP_FORWARD_DISTANCE_M,
+            -half_length,
+            half_length,
+        ),
+        clamp(
+            ball.y + state.infield_y_direction * 0.35,
+            -half_width,
+            half_width,
+        ),
+    )
+    if target[0] - ball.x < THROW_IN_MIN_FORWARD_PROGRESS_M:
+        return None
+    return target
+
+
+def _act_throw_in_pass_in_flight(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    kicker: Player,
+    receiver: Player,
+    state: ThrowInTacticState,
+    store,
+) -> None:
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+    ball = context.ball
+    if ball is None:
+        _abort_throw_in(players, store, "ball_unavailable")
+        return
+
+    support_target = _get_throw_in_rear_support_target(
+        context,
+        state,
+        receiver,
+    )
+    kicker.move_to_position(support_target)
+    kicker.action = "throw_in:kicker:rear_support"
+
+    movement, progress, lateral_deviation = _get_throw_in_ball_progress(
+        state,
+        ball.x,
+        ball.y,
+    )
+    receive_target = (
+        (ball.x, ball.y)
+        if progress >= THROW_IN_BALL_START_CONFIRM_DISTANCE_M
+        else state.receiver_target
+    )
+    if receive_target is not None:
+        _move_throw_in_receiver_to_target(
+            context,
+            receiver,
+            receive_target,
+            "throw_in:receiver:receive",
+            avoid_ball=False,
+        )
+
+    if (
+        movement >= THROW_IN_BALL_START_CONFIRM_DISTANCE_M
+        and progress <= THROW_IN_WRONG_DIRECTION_PROGRESS_M
+    ):
+        _abort_throw_in(players, store, "pass_reversed")
+        return
+    if lateral_deviation > THROW_IN_PASS_SEVERE_LATERAL_TOLERANCE_M:
+        _abort_throw_in(players, store, "pass_severely_deviated")
+        return
+    if _opponent_has_throw_in_arrival_advantage(context, receiver):
+        _abort_throw_in(players, store, "opponent_arrival_advantage")
+        return
+    if (
+        context.now - state.stage_started_at
+        >= THROW_IN_PASS_IN_FLIGHT_TIMEOUT_SEC
+    ):
+        _abort_throw_in(players, store, "pass_in_flight_timeout")
+        return
+
+    receiver_ball_distance = dist(
+        receiver.pose.x,
+        receiver.pose.y,
+        ball.x,
+        ball.y,
+    )
+    kicker_ball_distance = dist(
+        kicker.pose.x,
+        kicker.pose.y,
+        ball.x,
+        ball.y,
+    )
+    receiver_has_geometric_advantage = (
+        progress >= THROW_IN_RECEIVE_MIN_PROGRESS_M
+        and receiver_ball_distance <= THROW_IN_RECEIVER_BALL_DISTANCE_M
+        and receiver_ball_distance + THROW_IN_RECEIVER_CLOSER_MARGIN_M
+        < kicker_ball_distance
+        and lateral_deviation <= THROW_IN_PASS_LATERAL_TOLERANCE_M
+    )
+    if not receiver_has_geometric_advantage:
+        return
+
+    state.follow_up_target = _build_throw_in_follow_up_target(context, state)
+    state.follow_up_start_ball_position = None
+    state.follow_up_action_started = False
+    state.stage = ThrowInStage.FOLLOW_UP
+    state.stage_started_at = context.now
+
+
+def _act_throw_in_follow_up(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    kicker: Player,
+    receiver: Player,
+    state: ThrowInTacticState,
+    store,
+) -> None:
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+    ball = context.ball
+    if ball is None:
+        _abort_throw_in(players, store, "ball_unavailable")
+        return
+
+    kicker.move_to_position(
+        _get_throw_in_rear_support_target(context, state, receiver),
+    )
+    kicker.action = "throw_in:kicker:rear_support"
+
+    follow_up_start = state.follow_up_start_ball_position
+    follow_up_forward_progress = (
+        0.0
+        if follow_up_start is None
+        else ball.x - follow_up_start[0]
+    )
+    if (
+        state.follow_up_action_started
+        and follow_up_forward_progress >= THROW_IN_FOLLOW_UP_PROGRESS_M
+    ):
+        _finish_throw_in_tactic(
+            players,
+            store,
+            ThrowInStage.COMPLETE,
+            "follow_up_advanced",
+        )
+        return
+    if context.now - state.stage_started_at >= THROW_IN_FOLLOW_UP_TIMEOUT_SEC:
+        _abort_throw_in(players, store, "follow_up_timeout")
+        return
+
+    opponent_goal_target = opponent_goal(context)
+    goal_distance = dist(
+        ball.x,
+        ball.y,
+        opponent_goal_target[0],
+        opponent_goal_target[1],
+    )
+    should_shoot = (
+        state.region == ThrowInRegion.FRONTFIELD
+        and goal_distance <= THROW_IN_FRONT_SHOOT_DISTANCE_M
+    )
+    if should_shoot:
+        receiver.attack()
+        receiver.action = "throw_in:receiver:shoot"
+        if receiver.is_kicking and not state.follow_up_action_started:
+            state.follow_up_action_started = True
+            state.follow_up_start_ball_position = (ball.x, ball.y)
+        return
+
+    if state.follow_up_target is None:
+        state.follow_up_target = _build_throw_in_follow_up_target(
+            context,
+            state,
+        )
+    if state.follow_up_target is None:
+        _abort_throw_in(players, store, "follow_up_target_unavailable")
+        return
+    if not state.follow_up_action_started:
+        state.follow_up_start_ball_position = (ball.x, ball.y)
+        state.follow_up_action_started = True
+    receiver.directed_restart_kick(
+        state.follow_up_target,
+        THROW_IN_FOLLOW_UP_ADVANCE_POWER,
+    )
+    receiver.action = "throw_in:receiver:advance"
+
+
+def _act_consumed_throw_in_fallback(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
+    """同一界外球已结束时保持安全站位，绝不重新进入固定流程。"""
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+    for player in field_players:
+        player.stop()
+        player.action = "throw_in:consumed:hold"
+
+
+def _act_our_throw_in(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
+    """执行我方界外球专用固定战术及同上下文防重启。"""
+    if not _is_our_throw_in_context(context):
+        if getattr(store, "active_tactic", None) == "throw_in":
+            _abort_throw_in(players, store, "game_context_changed")
+        return
+
+    if getattr(store, "active_tactic", None) != "throw_in":
+        if getattr(store, "throw_in_context_consumed", False):
+            _act_consumed_throw_in_fallback(
+                context,
+                players,
+                goalkeeper,
+                store,
+            )
+            return
+
+        field_players = [
+            player for player in players if player is not goalkeeper
+        ]
+        if not field_players:
+            reason = (
+                "zero_available_players"
+                if not players
+                else "goalkeeper_only_safe_hold"
+            )
+            _consume_throw_in_context_without_tactic(store, reason)
+            _guard_throw_in_goalkeeper(
+                context,
+                goalkeeper,
+                field_players,
+                store,
+            )
+            return
+        if context.ball is None:
+            _consume_throw_in_context_without_tactic(
+                store,
+                "ball_unavailable",
+            )
+            _act_consumed_throw_in_fallback(
+                context,
+                players,
+                goalkeeper,
+                store,
+            )
+            return
+
+        kicker = _select_closest_player_to_ball(context, field_players)
+        receiver = next(
+            (player for player in field_players if player is not kicker),
+            None,
+        )
+        roles = ThrowInRoleAssignment(
+            goalkeeper_id=(
+                goalkeeper.id if goalkeeper is not None else None
+            ),
+            kicker_id=kicker.id,
+            receiver_id=receiver.id if receiver is not None else None,
+            available_player_ids_at_entry=tuple(
+                player.id for player in players
+            ),
+        )
+        state, planning_error = _build_throw_in_plan(
+            context,
+            kicker,
+            receiver,
+        )
+        if state is None:
+            _consume_throw_in_context_without_tactic(
+                store,
+                planning_error or "planning_failed",
+            )
+            _act_consumed_throw_in_fallback(
+                context,
+                players,
+                goalkeeper,
+                store,
+            )
+            return
+
+        store.active_tactic = "throw_in"
+        store.tactic_roles = roles
+        store.locked_roles = frozenset(
+            role_id
+            for role_id in (
+                roles.goalkeeper_id,
+                roles.kicker_id,
+                roles.receiver_id,
+            )
+            if role_id is not None
+        )
+        store.throw_in_state = state
+        store.throw_in_context_consumed = True
+        store.throw_in_last_outcome = None
+        store.throw_in_last_reason = None
+
+    roles = getattr(store, "tactic_roles", None)
+    state = getattr(store, "throw_in_state", None)
+    if not isinstance(roles, ThrowInRoleAssignment) or not isinstance(
+        state,
+        ThrowInTacticState,
+    ):
+        _abort_throw_in(players, store, "tactic_state_invalid")
+        return
+
+    locked_goalkeeper, kicker, receiver, role_error = _get_throw_in_roles(
+        players,
+        goalkeeper,
+        roles,
+    )
+    if role_error is not None:
+        _abort_throw_in(players, store, role_error)
+        return
+    if kicker is None:
+        _abort_throw_in(players, store, "kicker_missing")
+        return
+    if context.now - state.started_at >= THROW_IN_TOTAL_TIMEOUT_SEC:
+        _abort_throw_in(players, store, "total_timeout")
+        return
+
+    _draw_throw_in_plan(state)
+    if state.stage == ThrowInStage.POSITIONING:
+        _act_throw_in_positioning(
+            context,
+            players,
+            locked_goalkeeper,
+            kicker,
+            receiver,
+            state,
+            store,
+        )
+        return
+    if state.stage == ThrowInStage.KICKING:
+        _act_throw_in_kicking(
+            context,
+            players,
+            locked_goalkeeper,
+            kicker,
+            receiver,
+            state,
+            store,
+        )
+        return
+    if state.stage == ThrowInStage.PASS_IN_FLIGHT:
+        if receiver is None:
+            _abort_throw_in(players, store, "receiver_missing")
+            return
+        _act_throw_in_pass_in_flight(
+            context,
+            players,
+            locked_goalkeeper,
+            kicker,
+            receiver,
+            state,
+            store,
+        )
+        return
+    if state.stage == ThrowInStage.FOLLOW_UP:
+        if receiver is None:
+            _abort_throw_in(players, store, "receiver_missing")
+            return
+        _act_throw_in_follow_up(
+            context,
+            players,
+            locked_goalkeeper,
+            kicker,
+            receiver,
+            state,
+            store,
+        )
+        return
+    _abort_throw_in(players, store, "unexpected_stage")
+
+
 def _act_our_set_play(
     context: Context,
     players: list[Player],
@@ -3088,6 +4645,16 @@ def _act_our_set_play(
     store,
 ) -> None:
     """OUR_SET_PLAY:按定位球类型分派, TODO：加入自己的逻辑。默认为 _act_normal"""
+    set_play = get_set_play_type(context)
+    if set_play == SetPlay.THROW_IN:
+        _act_our_throw_in(
+            context,
+            players,
+            goalkeeper,
+            store,
+        )
+        return
+
     field_players = [
         player for player in players if player is not goalkeeper
     ]
@@ -3102,12 +4669,6 @@ def _act_our_set_play(
             )
         return
 
-    set_play = get_set_play_type(context)
-    if set_play == SetPlay.THROW_IN:
-        _act_normal(
-            context, players, goalkeeper, store, allow_ball_search=False,
-        )
-        return
     if set_play == SetPlay.CORNER_KICK:
         _act_normal(
             context, players, goalkeeper, store, allow_ball_search=False,
