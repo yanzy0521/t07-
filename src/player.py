@@ -299,6 +299,52 @@ class Player:
         self._draw_kick_target(tackle_target)
         return tackle_direction, DEFENSIVE_PRESSER_TACKLE_POWER
 
+    def _chase_ball_aggressively(self) -> None:
+        """以持续高速全向压迫球点，不执行通用走位的减速或转向等待。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        pose = self.pose
+        if ball is None or pose is None:
+            self.stop()
+            return
+
+        self.release_kick()
+        field_delta_x = ball.x - pose.x
+        field_delta_y = ball.y - pose.y
+        ball_distance = math.hypot(field_delta_x, field_delta_y)
+        if ball_distance <= 1e-6:
+            self.set_velocity(0.0, 0.0, 0.0)
+            return
+
+        inverse_distance = 1.0 / ball_distance
+        field_velocity_x = (
+            field_delta_x
+            * inverse_distance
+            * DEFENSIVE_PRESSER_CHASE_SPEED_MPS
+        )
+        field_velocity_y = (
+            field_delta_y
+            * inverse_distance
+            * DEFENSIVE_PRESSER_CHASE_SPEED_MPS
+        )
+        cos_heading = math.cos(pose.theta)
+        sin_heading = math.sin(pose.theta)
+        body_velocity_x = (
+            field_velocity_x * cos_heading
+            + field_velocity_y * sin_heading
+        )
+        body_velocity_y = (
+            -field_velocity_x * sin_heading
+            + field_velocity_y * cos_heading
+        )
+        ball_direction = math.atan2(field_delta_y, field_delta_x)
+        heading_error = normalize_angle(ball_direction - pose.theta)
+        self.set_velocity(
+            body_velocity_x,
+            body_velocity_y,
+            self._angular(heading_error),
+        )
+
     def _goal_target_for_direction(
         self, kick_direction: float,
     ) -> tuple[float, float]:
@@ -922,15 +968,7 @@ class Player:
             else DEFENSIVE_PRESSER_TACKLE_ENTER_DISTANCE_M
         )
         if ball_distance > tackle_distance_limit:
-            self.release_kick()
-            ball_direction = angle_to(pose.x, pose.y, ball.x, ball.y)
-            self.walk_to(
-                (ball.x, ball.y),
-                face=ball_direction,
-                avoid_ball=False,
-                avoid_robots=False,
-                preserve_ball_handling_role=True,
-            )
+            self._chase_ball_aggressively()
             self.action = "defensive_presser:chase"
             return
 

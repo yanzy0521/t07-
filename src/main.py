@@ -2338,9 +2338,26 @@ def _estimate_open_play_mode(
     )
     ball_in_danger_area = _ball_in_own_danger_area(context)
 
+    opponent_is_actively_challenging = (
+        opponent_nearest_distance is not None
+        and opponent_nearest_distance
+        <= OPEN_PLAY_OPPONENT_ACTIVE_CHALLENGE_DISTANCE_M
+    )
+
     if ball_in_danger_area:
         candidate_mode = OpenPlayMode.DEFENDING
         reason = "own_danger_area"
+    elif opponent_is_actively_challenging:
+        if (
+            distance_advantage is not None
+            and distance_advantage
+            <= -OPEN_PLAY_DEFENSE_DISTANCE_ADVANTAGE_M
+        ):
+            candidate_mode = OpenPlayMode.DEFENDING
+            reason = "opponent_active_challenge_advantage"
+        else:
+            candidate_mode = OpenPlayMode.CONTESTED
+            reason = "opponent_active_challenge"
     elif distance_advantage is not None:
         if distance_advantage >= OPEN_PLAY_ATTACK_DISTANCE_ADVANTAGE_M:
             candidate_mode = OpenPlayMode.ATTACKING
