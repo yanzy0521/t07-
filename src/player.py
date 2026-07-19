@@ -330,7 +330,7 @@ class Player:
     def _get_penalty_tackle_reposition_target(
         self,
     ) -> tuple[float, float] | None:
-        """返回场内受限的简单球后安全点，避免错误侧直接触球。"""
+        """返回球障碍外的可达后侧点，避免错误侧直接触球。"""
         context = self.context
         ball = context.ball if context is not None else None
         if context is None or ball is None:

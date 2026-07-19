@@ -34,9 +34,10 @@ offensive striker、守门员 CLEAR、开球、重启和其他走位入口保持
 
 1. 先判断 presser 是否满足 `pose.x <= ball.x - 0.10m`。
 2. 满足球后侧条件且距离满足迟滞门槛时，以 `4.0` 力度向 `+X` 出脚。
-3. 不满足球后侧条件时立即释放旧踢球命令，向 `(ball.x - 0.35m, ball.y)` 移动。
+3. 不满足球后侧条件时立即释放旧踢球命令，向 `(ball.x - 0.75m, ball.y)` 移动。`0.75m` 使目标位于约 `0.5m` 的球障碍之外，避免路径规划目标不可达。
 4. 球后目标限制在场内安全范围内，但不启用 offensive striker 绕球、角度对齐或外侧目标选择。
-5. 该安全动作使用可辨识 action 标签，使 M-05 将正在获取安全侧的 presser 视为受保护职责。
+5. presser 不必走完整个 0.75m；一旦纵向位置满足后侧安全条件，下一帧立即转为直追和低力度抢断。
+6. 该安全动作使用可辨识 action 标签，使 M-05 将正在获取安全侧的 presser 视为受保护职责。
 
 ## Parameters
 
@@ -46,7 +47,7 @@ offensive striker、守门员 CLEAR、开球、重启和其他走位入口保持
 - `DEFENSIVE_PRESSER_TACKLE_ENTER_DISTANCE_M = 0.65`
 - `DEFENSIVE_PRESSER_TACKLE_EXIT_DISTANCE_M = 0.80`
 - `DEFENSIVE_PRESSER_PENALTY_BEHIND_MARGIN_M = 0.10`
-- `DEFENSIVE_PRESSER_PENALTY_BEHIND_TARGET_DISTANCE_M = 0.35`
+- `DEFENSIVE_PRESSER_PENALTY_BEHIND_TARGET_DISTANCE_M = 0.75`
 - `DEFENSIVE_PRESSER_PENALTY_TARGET_FIELD_MARGIN_M`：用于限制安全目标在场内，建议复用当前防守场地余量数值 `0.30m`，但保留独立前缀。
 
 ## Kick Planning
