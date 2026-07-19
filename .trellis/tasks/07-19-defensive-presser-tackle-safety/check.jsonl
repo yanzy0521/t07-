@@ -1,0 +1,3 @@
+{"file":".trellis/spec/backend/index.md","reason":"Review defensive strategy source changes against project guidance."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check parameter centralization and complete old-reference replacement without automated verification."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review player action labels, main M-05 protection, and role boundary consistency."}

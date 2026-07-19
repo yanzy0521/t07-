@@ -1,0 +1,3 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend strategy and player source modification guidance."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Centralize defensive presser parameters and search all old references before modification."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace parameter, player action, main action labels, and M-05 protection across layers."}
