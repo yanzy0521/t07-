@@ -117,6 +117,10 @@ class Player:
         # 踢球迟滞状态(跨帧)
         self._kicking: bool = False
 
+        # 同一机器人同一时刻只维护一种高层球处理职责。职责变化时会统一清除
+        # 进攻绕球状态和旧踢球命令，避免攻防动作跨帧互相继承。
+        self._ball_handling_role: str = "none"
+
         # 追球接近状态:在球的错误一侧时,保持固定方向沿球周围绕到射门线后方。
         self._ball_approach_mode: str = "direct"
         self._ball_approach_side: float | None = None
@@ -206,7 +210,14 @@ class Player:
             return
         self._backend.set_velocity(vx, vy, vyaw)
 
-    def stop(self, *, preserve_ball_approach: bool = False) -> None:
+    def stop(
+        self,
+        *,
+        preserve_ball_approach: bool = False,
+        preserve_ball_handling_role: bool = False,
+    ) -> None:
+        if not preserve_ball_handling_role:
+            self._set_ball_handling_role("none")
         if not preserve_ball_approach:
             self._reset_ball_approach()
         self.release_kick()
@@ -218,8 +229,8 @@ class Player:
 
     def kick(
         self,
-        kick_direction: float | None = None,
-        power: float = KICK_POWER_DEFAULT,
+        kick_direction: float,
+        power: float,
     ) -> None:
         pose = self.pose
         if pose is None:
@@ -230,13 +241,6 @@ class Player:
         if ball is None:
             _log.warning("player %d kick skipped: ball unknown", self.id)
             return
-
-        if kick_direction is None:
-            kick_plan = self.plan_kick()
-            if kick_plan is None:
-                _log.warning("player %d kick skipped: kick plan unavailable", self.id)
-                return
-            kick_direction, power = kick_plan
 
         if self._backend is None:
             _log.debug(
@@ -257,10 +261,10 @@ class Player:
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
-    def plan_kick(self) -> tuple[float, float] | None:
-        """计算踢球方向和力度。
+    def plan_offensive_shot(self) -> tuple[float, float] | None:
+        """计算 offensive striker 的射门方向和力度。
 
-        从当前球位踢向对方球门中心,力度 2.0。
+        从当前球位踢向对方球门中心，并使用独立的进攻射门力度。
         返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
         """
         ctx = self.context
@@ -272,12 +276,30 @@ class Player:
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
         kick_target = self._goal_target_for_direction(kick_direction)
         kick_power = (
-            KICK_POWER_BACKFIELD if self._in_backfield()
-            else KICK_POWER_DEFAULT
+            OFFENSIVE_STRIKER_BACKFIELD_KICK_POWER
+            if self._in_backfield()
+            else OFFENSIVE_STRIKER_KICK_POWER
         )
 
         self._draw_kick_target(kick_target)
         return kick_direction, kick_power
+
+    def plan_defensive_clear(self) -> tuple[float, float] | None:
+        """计算 defensive presser 的独立解围方向和力度。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None:
+            return None
+
+        clearance_target = opponent_goal(context)
+        clearance_direction = angle_to(
+            ball.x,
+            ball.y,
+            clearance_target[0],
+            clearance_target[1],
+        )
+        self._draw_kick_target(clearance_target)
+        return clearance_direction, DEFENSIVE_PRESSER_CLEAR_POWER
 
     def _goal_target_for_direction(
         self, kick_direction: float,
@@ -306,7 +328,7 @@ class Player:
         return ball.x < 0
 
     def _draw_kick_target(self, target: tuple[float, float]) -> None:
-        """以 X 标出 plan_kick 选择的踢球目标。"""
+        """以 X 标出高层踢球规划器选择的目标。"""
         from .framework import debugdraw
 
         x, y = target
@@ -420,6 +442,7 @@ class Player:
         avoid_robots: bool = False,
         arrive_dist: float = ARRIVE_DIST,
         preserve_ball_approach: bool = False,
+        preserve_ball_handling_role: bool = False,
     ) -> bool:
         """走向目标点。返回是否已到达。
 
@@ -431,6 +454,8 @@ class Player:
         行走两种模式:近距离全向,远距离弧线行走或大角差原地转向。``face`` 指定
         到达/近距离时的朝向。
         """
+        if not preserve_ball_handling_role:
+            self._set_ball_handling_role("none")
         if not preserve_ball_approach:
             self._reset_ball_approach()
         self.release_kick() # 踢球状态下，走位会被覆盖，先取消踢球状态
@@ -454,10 +479,16 @@ class Player:
                 else:
                     self.stop(
                         preserve_ball_approach=preserve_ball_approach,
+                        preserve_ball_handling_role=(
+                            preserve_ball_handling_role
+                        ),
                     )
             else:
                 self.stop(
                     preserve_ball_approach=preserve_ball_approach,
+                    preserve_ball_handling_role=(
+                        preserve_ball_handling_role
+                    ),
                 )
             return True
 
@@ -646,6 +677,20 @@ class Player:
     # 高层动作(策略在 main.py 里直接调这些)
     # ------------------------------------------------------------------
 
+    def _set_ball_handling_role(self, role: str) -> None:
+        """切换高层球处理职责，并清除旧职责的跨帧动作状态。"""
+        if role == self._ball_handling_role:
+            return
+        self._reset_ball_approach()
+        self.release_kick()
+        self._ball_handling_role = role
+
+    def reset_ball_handling_state(self) -> None:
+        """供重启等非普通攻防动作显式释放旧球处理职责。"""
+        self._reset_ball_approach()
+        self.release_kick()
+        self._ball_handling_role = "none"
+
     def _reset_ball_approach(self, *, clear_fallback: bool = True) -> None:
         self._ball_approach_mode = "direct"
         self._ball_approach_side = None
@@ -681,24 +726,25 @@ class Player:
                 and alignment_error * self._ball_approach_side <= 0.0
             )
             if (
-                absolute_alignment_error <= CHASE_DIRECT_ENTER_ANGLE_RAD
+                absolute_alignment_error
+                <= OFFENSIVE_STRIKER_DIRECT_ENTER_ANGLE_RAD
                 or passed_target_angle
             ):
                 self._reset_ball_approach(clear_fallback=False)
             else:
                 progress = self._ball_approach_best_error - absolute_alignment_error
-                if progress >= CHASE_CIRCLE_PROGRESS_RAD:
+                if progress >= OFFENSIVE_STRIKER_CIRCLE_PROGRESS_RAD:
                     self._ball_approach_best_error = absolute_alignment_error
                     self._ball_approach_last_progress_at = now
 
                 progress_timed_out = (
                     self._ball_approach_last_progress_at is not None
                     and now - self._ball_approach_last_progress_at
-                    >= CHASE_CIRCLE_TIMEOUT_SEC
+                    >= OFFENSIVE_STRIKER_CIRCLE_TIMEOUT_SEC
                 )
                 if progress_timed_out:
                     self._ball_approach_direct_until = (
-                        now + CHASE_CIRCLE_FALLBACK_SEC
+                        now + OFFENSIVE_STRIKER_CIRCLE_FALLBACK_SEC
                     )
                     self._reset_ball_approach(clear_fallback=False)
 
@@ -706,7 +752,8 @@ class Player:
         if (
             self._ball_approach_mode == "direct"
             and not direct_fallback_active
-            and absolute_alignment_error >= CHASE_DIRECT_EXIT_ANGLE_RAD
+            and absolute_alignment_error
+            >= OFFENSIVE_STRIKER_DIRECT_EXIT_ANGLE_RAD
         ):
             self._ball_approach_mode = "circle"
             self._ball_approach_side = 1.0 if alignment_error >= 0.0 else -1.0
@@ -714,9 +761,14 @@ class Player:
             self._ball_approach_last_progress_at = now
 
         if self._ball_approach_mode != "circle":
-            self.action = "attack:direct"
+            self.action = "offensive_striker:direct"
             return (
-                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M),
+                _behind_ball(
+                    ball.x,
+                    ball.y,
+                    kick_target,
+                    OFFENSIVE_STRIKER_BEHIND_BALL_DISTANCE_M,
+                ),
                 kick_direction,
             )
 
@@ -729,15 +781,21 @@ class Player:
             remaining_angle = (
                 player_angle_around_ball - desired_behind_angle
             ) % (2.0 * math.pi)
-        angular_step = min(remaining_angle, CHASE_CIRCLE_STEP_RAD)
+        angular_step = min(
+            remaining_angle,
+            OFFENSIVE_STRIKER_CIRCLE_STEP_RAD,
+        )
         waypoint_angle = player_angle_around_ball + approach_side * angular_step
         circle_target = (
-            ball.x + math.cos(waypoint_angle) * CHASE_CIRCLE_RADIUS_M,
-            ball.y + math.sin(waypoint_angle) * CHASE_CIRCLE_RADIUS_M,
+            ball.x
+            + math.cos(waypoint_angle) * OFFENSIVE_STRIKER_CIRCLE_RADIUS_M,
+            ball.y
+            + math.sin(waypoint_angle) * OFFENSIVE_STRIKER_CIRCLE_RADIUS_M,
         )
         self.action = (
-            "attack:circle_left"
-            if approach_side > 0.0 else "attack:circle_right"
+            "offensive_striker:circle_left"
+            if approach_side > 0.0
+            else "offensive_striker:circle_right"
         )
         debugdraw.point(
             circle_target[0], circle_target[1],
@@ -778,6 +836,7 @@ class Player:
         踢球迟滞同时检查距球和球后方对齐角度。不在合适一侧时,保持固定绕行方向
         沿球周围接近;对齐后再走直接球后点并踢球。不避障——正常拼抢要直取球。
         """
+        self._set_ball_handling_role("offensive_striker")
         ball = self.context.ball if self.context is not None else None
         if ball is None or self.pose is None:
             self._reset_ball_approach()
@@ -795,10 +854,15 @@ class Player:
         alignment_error = abs(normalize_angle(
             desired_behind_angle - player_angle_around_ball,
         ))
-        kick_distance_limit = KICK_EXIT_M if self._kicking else KICK_ENTER_M
+        kick_distance_limit = (
+            OFFENSIVE_STRIKER_KICK_EXIT_M
+            if self._kicking
+            else OFFENSIVE_STRIKER_KICK_ENTER_M
+        )
         kick_alignment_limit = (
-            CHASE_DIRECT_EXIT_ANGLE_RAD
-            if self._kicking else CHASE_DIRECT_ENTER_ANGLE_RAD
+            OFFENSIVE_STRIKER_DIRECT_EXIT_ANGLE_RAD
+            if self._kicking
+            else OFFENSIVE_STRIKER_DIRECT_ENTER_ANGLE_RAD
         )
         self._kicking = (
             d <= kick_distance_limit
@@ -806,7 +870,7 @@ class Player:
         )
         if self._kicking:
             self._reset_ball_approach()
-            kick_plan = self.plan_kick()
+            kick_plan = self.plan_offensive_shot()
             if kick_plan is None:
                 self.stop()
                 return
@@ -821,7 +885,44 @@ class Player:
                 approach_target,
                 face=kick_direction,
                 preserve_ball_approach=True,
+                preserve_ball_handling_role=True,
             )
+
+    def defensive_press_and_clear(self) -> None:
+        """直接逼抢并按独立防守规划解围，不使用进攻绕球和射门迟滞。"""
+        self._set_ball_handling_role("defensive_presser")
+        self._reset_ball_approach()
+        context = self.context
+        ball = context.ball if context is not None else None
+        pose = self.pose
+        if context is None or ball is None or pose is None:
+            self.action = "defensive_presser:no_ball"
+            self.stop()
+            return
+
+        ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+        if ball_distance > DEFENSIVE_PRESSER_CLEAR_DISTANCE_M:
+            self.release_kick()
+            ball_direction = angle_to(pose.x, pose.y, ball.x, ball.y)
+            self.walk_to(
+                (ball.x, ball.y),
+                face=ball_direction,
+                avoid_ball=False,
+                avoid_robots=False,
+                preserve_ball_handling_role=True,
+            )
+            self.action = "defensive_presser:chase"
+            return
+
+        clearance_plan = self.plan_defensive_clear()
+        if clearance_plan is None:
+            self.action = "defensive_presser:no_ball"
+            self.stop()
+            return
+
+        clearance_direction, clearance_power = clearance_plan
+        self.kick(clearance_direction, clearance_power)
+        self.action = "defensive_presser:clear"
 
     def search_for_ball(
         self,
@@ -829,8 +930,7 @@ class Player:
         sweep_direction: float,
     ) -> None:
         """先朝最后球位转向,随后按整队搜索方向原地低速扫场。"""
-        self._reset_ball_approach()
-        self.release_kick()
+        self.reset_ball_handling_state()
         pose = self.pose
         if pose is None:
             self.stop()
@@ -921,7 +1021,7 @@ class Player:
         power: float,
     ) -> None:
         """接近门前球并按指定正向目标解围，不使用普通进攻绕球状态。"""
-        self._reset_ball_approach()
+        self.reset_ball_handling_state()
         context = self.context
         ball = context.ball if context is not None else None
         pose = self.pose
