@@ -105,6 +105,7 @@ class Player:
         # SDK 缓存字段,框架后台会自动更新
         self._mode: str | None = None
         self._fall_down_state: str | None = None
+        self._readiness_actions_allowed: bool = False
 
         # 避障绕行侧记忆(跨帧;None=当前无绕行)
         self._avoid_side: float | None = None
@@ -356,13 +357,30 @@ class Player:
     # 慢操作（同步接口异步调取，使得不阻塞）
     # ------------------------------------------------------------------
 
+    def set_readiness_actions_allowed(self, allowed: bool) -> None:
+        """同步 readiness 许可；禁止时由 backend 取消排队中的慢操作。"""
+        self._readiness_actions_allowed = allowed
+        if self._backend is None:
+            return
+        update_permission = getattr(
+            self._backend,
+            "set_readiness_actions_allowed",
+            None,
+        )
+        if callable(update_permission):
+            update_permission(allowed)
+
     def request_mode(self, mode: str) -> None:
+        if not self._readiness_actions_allowed:
+            return
         if self._backend is None:
             _log.debug("player %d request_mode -> %s (no backend)", self.id, mode)
             return
         self._backend.request_mode(mode)
 
     def get_up(self) -> None:
+        if not self._readiness_actions_allowed:
+            return
         if self._backend is None:
             _log.debug("player %d get_up (no backend)", self.id)
             return

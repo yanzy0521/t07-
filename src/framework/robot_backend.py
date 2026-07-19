@@ -51,9 +51,12 @@ class RobotBackend:
         self._fall_down_recoverable: bool = False
         self._kicking = False
 
-        # 慢操作 worker:长度 1 覆盖式意图槽 + 唤醒事件
-        self._pending: tuple[str, object] | None = None
+        # 慢操作 worker:长度 1 覆盖式意图槽 + 唤醒事件。readiness generation
+        # 用于让状态边界之前排队的旧意图失效。
+        self._pending: tuple[int, str, object] | None = None
         self._slot_lock = threading.Lock()
+        self._readiness_actions_allowed = False
+        self._readiness_generation = 0
         self._wake = threading.Event()
         self._worker_stop = threading.Event()
         self._last_get_up_at = 0.0
@@ -167,6 +170,19 @@ class RobotBackend:
     # 慢操作(步骤 3)—— 非阻塞,由 worker 线程执行
     # ------------------------------------------------------------------
 
+    def set_readiness_actions_allowed(self, allowed: bool) -> None:
+        """更新起身/模式切换许可,禁止时原子取消尚未执行的旧意图。"""
+        with self._slot_lock:
+            if self._readiness_actions_allowed == allowed:
+                return
+            self._readiness_actions_allowed = allowed
+            self._readiness_generation += 1
+            if not allowed:
+                self._pending = None
+                self._last_get_up_at = 0.0
+        if not allowed:
+            self._wake.set()
+
     def request_mode(self, mode: str) -> None:
         """异步请求切换 SDK mode。已在目标模式则短路。"""
         if self._mode == mode:
@@ -178,13 +194,29 @@ class RobotBackend:
         now = time.monotonic()
         if now - self._last_get_up_at < _GET_UP_THROTTLE_SEC:
             return
-        self._last_get_up_at = now
-        self._enqueue(("get_up", None))
+        if self._enqueue(("get_up", None)):
+            self._last_get_up_at = now
 
-    def _enqueue(self, intent: tuple[str, object]) -> None:
+    def _enqueue(self, intent: tuple[str, object]) -> bool:
         with self._slot_lock:
-            self._pending = intent   # 覆盖式:只保留最后一个
+            if not self._readiness_actions_allowed:
+                return False
+            kind, argument = intent
+            self._pending = (
+                self._readiness_generation,
+                kind,
+                argument,
+            )  # 覆盖式:只保留最后一个
         self._wake.set()
+        return True
+
+    def _readiness_intent_is_allowed(self, generation: int) -> bool:
+        """在慢 SDK 调用前复核许可,阻止上一帧意图越过状态边界。"""
+        with self._slot_lock:
+            return (
+                self._readiness_actions_allowed
+                and generation == self._readiness_generation
+            )
 
     def _worker_loop(self) -> None:
         while not self._worker_stop.is_set():
@@ -202,11 +234,11 @@ class RobotBackend:
                 self._pending = None
             if intent is None:
                 continue
-            kind, arg = intent
+            generation, kind, arg = intent
             if kind == "mode":
-                self._exec_set_mode(cast(str, arg))
+                self._exec_set_mode(cast(str, arg), generation)
             elif kind == "get_up":
-                self._exec_get_up()
+                self._exec_get_up(generation)
 
     def _poll_mode(self) -> None:
         try:
@@ -237,7 +269,9 @@ class RobotBackend:
             recoverable_value if isinstance(recoverable_value, bool) else False
         )
 
-    def _exec_set_mode(self, mode: str) -> None:
+    def _exec_set_mode(self, mode: str, generation: int) -> None:
+        if not self._readiness_intent_is_allowed(generation):
+            return
         try:
             self._robot.set_gait("soccer")
             self._robot.set_mode(mode)
@@ -246,7 +280,9 @@ class RobotBackend:
         except Exception as exc:
             _log.warning("player %d set_mode(%s) failed: %s", self._player_id, mode, exc)
 
-    def _exec_get_up(self) -> None:
+    def _exec_get_up(self, generation: int) -> None:
+        if not self._readiness_intent_is_allowed(generation):
+            return
         try:
             self._robot.get_up()
             self._mode = None   # 起身后 mode 未知,需重新 request_mode

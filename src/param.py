@@ -181,6 +181,30 @@ BALL_SEARCH_SWEEP_SEC = 2.5
 
 
 # ======================================================================
+# M-05 长时间无活动预防
+# ======================================================================
+
+INACTIVITY_BALL_DISTANCE_M = 3.0
+INACTIVITY_RULE_TIMEOUT_SEC = 10.0
+INACTIVITY_PREVENTION_TRIGGER_SEC = 8.0
+
+# 以静止窗口锚点到当前实际 pose 的位移确认有效移动,忽略毫米/厘米级抖动。
+INACTIVITY_MOVEMENT_RESET_M = 0.18
+INACTIVITY_NUDGE_DISTANCE_M = 0.42
+INACTIVITY_GOALKEEPER_NUDGE_DISTANCE_M = 0.30
+INACTIVITY_GOALKEEPER_LONGITUDINAL_ADJUSTMENT_M = 0.10
+INACTIVITY_NUDGE_ARRIVE_DISTANCE_M = 0.08
+INACTIVITY_MIN_TARGET_DISPLACEMENT_M = 0.24
+INACTIVITY_NUDGE_TIMEOUT_SEC = 1.8
+INACTIVITY_NUDGE_COOLDOWN_SEC = 1.0
+
+# 目标生成只使用动态相对方向；这些参数控制场内余量和远离球的轻微偏置。
+INACTIVITY_FIELD_MARGIN_M = 0.35
+INACTIVITY_AWAY_FROM_BALL_BIAS = 0.35
+INACTIVITY_KICKOFF_HALF_MARGIN_M = 0.10
+
+
+# ======================================================================
 # 开球 / 定位球策略
 # ======================================================================
 

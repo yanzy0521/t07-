@@ -114,6 +114,23 @@ class GoalkeeperThreatEstimate:
     reason: str
 
 
+@dataclass
+class InactivityPreventionState:
+    """单个机器人基于实际 pose 的 M-05 静止窗口和 nudge 状态。"""
+
+    last_sample_position: tuple[float, float] | None = None
+    stationary_anchor_position: tuple[float, float] | None = None
+    stationary_window_started_at: float | None = None
+    last_confirmed_movement_at: float | None = None
+    nudge_active: bool = False
+    nudge_target: tuple[float, float] | None = None
+    nudge_start_position: tuple[float, float] | None = None
+    nudge_started_at: float | None = None
+    nudge_action: str | None = None
+    nudge_phase: Phase | None = None
+    cooldown_until: float = 0.0
+
+
 def get_phase(context: Context) -> Phase:
     """根据裁判机状态判断当前比赛阶段。"""
     g = context.game
@@ -215,6 +232,8 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.goalkeeper_ball_speed = None
         store.goalkeeper_target = None
         store.goalkeeper_clearance_target = None
+        store.inactivity_prevention_states = {}
+        store.inactivity_prevention_active_player_id = None
         store.player_availability = {}
         store.available_player_ids = ()
         store.default_goalkeeper_id = None
@@ -240,6 +259,12 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.prev_phase = store.cur_phase
         store.cur_phase = phase
 
+        readiness_actions_allowed = phase != Phase.STOPPED
+        _synchronize_readiness_permissions(
+            players,
+            readiness_actions_allowed,
+        )
+
         # 画可视化(每帧)
         _analyze_and_draw(context, players, store)
 
@@ -255,7 +280,11 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
 
-        available_players = _collect_available_players(players, store)
+        available_players = _collect_available_players(
+            players,
+            store,
+            readiness_actions_allowed,
+        )
         current_goalkeeper = _select_current_goalkeeper(
             context,
             players,
@@ -296,24 +325,57 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
                 player.action = "stopped"
                 player.stop()
 
+        _apply_inactivity_prevention(
+            context,
+            players,
+            available_players,
+            current_goalkeeper,
+            phase,
+            store,
+        )
+
         # 队员可视化统一在最后画一遍:覆盖所有球员(含判罚/未就绪/STOPPED),
         # 修复 SET 等状态下红球/标签消失的问题。
         for p in players:
             _draw_teammate_marker(p)
 
 
-def _collect_available_players(players: list[Player], store) -> list[Player]:
+def _synchronize_readiness_permissions(
+    players: list[Player],
+    phase_allows_readiness: bool,
+) -> None:
+    """先于 readiness 检查同步许可,并在禁行状态取消旧异步意图。"""
+    for player in players:
+        player.set_readiness_actions_allowed(
+            phase_allows_readiness and not player.is_penalized,
+        )
+
+
+def _collect_available_players(
+    players: list[Player],
+    store,
+    readiness_actions_allowed: bool,
+) -> list[Player]:
     """统一分类每帧可用性,并清除不可用球员的旧动作命令。"""
     player_availability: dict[int, str] = {}
     available_players: list[Player] = []
 
     for player in players:
-        ready = player.ensure_ready()
         if player.is_penalized:
             availability = "penalized"
+        elif readiness_actions_allowed:
+            ready = player.ensure_ready()
+            if player.is_fallen:
+                availability = "fallen"
+            elif not ready:
+                availability = "switching_mode"
+            elif player.pose is None:
+                availability = "no_pose"
+            else:
+                availability = "available"
         elif player.is_fallen:
             availability = "fallen"
-        elif not ready:
+        elif player.mode != "walk":
             availability = "switching_mode"
         elif player.pose is None:
             availability = "no_pose"
@@ -332,6 +394,653 @@ def _collect_available_players(players: list[Player], store) -> list[Player]:
         player.id for player in available_players
     )
     return available_players
+
+
+def _get_inactivity_prevention_state(
+    store,
+    player_id: int,
+) -> InactivityPreventionState:
+    states = getattr(store, "inactivity_prevention_states", None)
+    if states is None:
+        states = {}
+        store.inactivity_prevention_states = states
+    state = states.get(player_id)
+    if state is None:
+        state = InactivityPreventionState()
+        states[player_id] = state
+    return state
+
+
+def _clear_inactivity_nudge(state: InactivityPreventionState) -> None:
+    state.nudge_active = False
+    state.nudge_target = None
+    state.nudge_start_position = None
+    state.nudge_started_at = None
+    state.nudge_action = None
+    state.nudge_phase = None
+
+
+def _clear_inactivity_window(
+    state: InactivityPreventionState,
+    current_position: tuple[float, float] | None,
+) -> None:
+    """条件失效时清除窗口,避免跨 STOP、罚下或观测丢失继承计时。"""
+    state.last_sample_position = current_position
+    state.stationary_anchor_position = None
+    state.stationary_window_started_at = None
+    state.last_confirmed_movement_at = None
+    state.cooldown_until = 0.0
+    _clear_inactivity_nudge(state)
+
+
+def _confirm_inactivity_movement(
+    state: InactivityPreventionState,
+    current_position: tuple[float, float],
+    now: float,
+) -> None:
+    """记录已由实际 pose 确认的有效平移,并从当前位置重开静止窗口。"""
+    state.last_sample_position = current_position
+    state.stationary_anchor_position = current_position
+    state.stationary_window_started_at = now
+    state.last_confirmed_movement_at = now
+    state.cooldown_until = now + INACTIVITY_NUDGE_COOLDOWN_SEC
+    _clear_inactivity_nudge(state)
+
+
+def _player_is_inactivity_eligible(
+    context: Context,
+    player: Player,
+) -> bool:
+    game = context.game
+    ball = context.ball
+    pose = player.pose
+    if (
+        game is None
+        or game.state != GameState.PLAYING
+        or game.stopped
+        or player.is_penalized
+        or pose is None
+        or ball is None
+    ):
+        return False
+    return (
+        dist(pose.x, pose.y, ball.x, ball.y)
+        <= INACTIVITY_BALL_DISTANCE_M
+    )
+
+
+def _update_inactivity_tracking(
+    context: Context,
+    players: list[Player],
+    store,
+) -> set[int]:
+    """更新实际位移锚点,返回本帧满足 M-05 计时条件的球员编号。"""
+    eligible_player_ids: set[int] = set()
+    active_player_id = getattr(
+        store,
+        "inactivity_prevention_active_player_id",
+        None,
+    )
+
+    for player in players:
+        state = _get_inactivity_prevention_state(store, player.id)
+        pose = player.pose
+        current_position = (
+            (pose.x, pose.y) if pose is not None else None
+        )
+        if not _player_is_inactivity_eligible(context, player):
+            _clear_inactivity_window(state, current_position)
+            if active_player_id == player.id:
+                active_player_id = None
+            continue
+
+        eligible_player_ids.add(player.id)
+        if current_position is None:
+            continue
+
+        state.last_sample_position = current_position
+        anchor_position = state.stationary_anchor_position
+        if anchor_position is None:
+            state.stationary_anchor_position = current_position
+            state.stationary_window_started_at = context.now
+            state.last_confirmed_movement_at = context.now
+            continue
+
+        displacement_from_anchor = dist(
+            anchor_position[0],
+            anchor_position[1],
+            current_position[0],
+            current_position[1],
+        )
+        if displacement_from_anchor >= INACTIVITY_MOVEMENT_RESET_M:
+            _confirm_inactivity_movement(
+                state,
+                current_position,
+                context.now,
+            )
+            if active_player_id == player.id:
+                active_player_id = None
+
+    store.inactivity_prevention_active_player_id = active_player_id
+    return eligible_player_ids
+
+
+def _clamp_inactivity_target_to_field(
+    context: Context,
+    target: tuple[float, float],
+) -> tuple[float, float]:
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - INACTIVITY_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - INACTIVITY_FIELD_MARGIN_M,
+    )
+    return (
+        clamp(target[0], -half_length, half_length),
+        clamp(target[1], -half_width, half_width),
+    )
+
+
+def _constrain_inactivity_target(
+    context: Context,
+    target: tuple[float, float],
+    phase: Phase,
+) -> tuple[float, float] | None:
+    """把动态 nudge 目标投影到当前重启规则允许的区域。"""
+    safe_target = _clamp_inactivity_target_to_field(context, target)
+    if phase == Phase.OUR_KICKOFF:
+        safe_target = (
+            min(safe_target[0], -INACTIVITY_KICKOFF_HALF_MARGIN_M),
+            safe_target[1],
+        )
+    elif phase == Phase.OPP_KICKOFF:
+        safe_target = (
+            min(safe_target[0], -INACTIVITY_KICKOFF_HALF_MARGIN_M),
+            safe_target[1],
+        )
+        safe_target = _prepare_restart_target(
+            context,
+            safe_target,
+            stay_outside_center_circle=True,
+        )
+    elif phase == Phase.OPP_SET_PLAY:
+        safe_target = _prepare_restart_target(context, safe_target)
+
+    safe_target = _clamp_inactivity_target_to_field(context, safe_target)
+    ball = context.ball
+    if phase in (Phase.OPP_KICKOFF, Phase.OPP_SET_PLAY):
+        if (
+            ball is None
+            or dist(safe_target[0], safe_target[1], ball.x, ball.y)
+            < OPPONENT_RESTART_AVOID_M
+        ):
+            return None
+    if phase == Phase.OPP_KICKOFF:
+        center_clearance = context.field.circle_radius + CIRCLE_MARGIN_M
+        if (
+            safe_target[0] > -INACTIVITY_KICKOFF_HALF_MARGIN_M
+            or math.hypot(safe_target[0], safe_target[1]) < center_clearance
+        ):
+            return None
+    if (
+        phase == Phase.OUR_KICKOFF
+        and safe_target[0] > -INACTIVITY_KICKOFF_HALF_MARGIN_M
+    ):
+        return None
+    return safe_target
+
+
+def _get_relative_inactivity_target(
+    context: Context,
+    player: Player,
+    phase: Phase,
+) -> tuple[float, float] | None:
+    """优先沿球的切向并略微远离球,生成不依赖固定比赛坐标的小位移。"""
+    pose = player.pose
+    ball = context.ball
+    if pose is None or ball is None:
+        return None
+
+    away_x = pose.x - ball.x
+    away_y = pose.y - ball.y
+    away_length = math.hypot(away_x, away_y)
+    if away_length <= 1e-6:
+        own_goal_x, own_goal_y = own_goal(context)
+        away_x = own_goal_x - ball.x
+        away_y = own_goal_y - ball.y
+        away_length = math.hypot(away_x, away_y)
+    if away_length <= 1e-6:
+        away_x, away_y, away_length = -1.0, 0.0, 1.0
+
+    away_x /= away_length
+    away_y /= away_length
+    tangent_x = -away_y
+    tangent_y = away_x
+    preferred_side = 1.0 if player.id % 2 == 0 else -1.0
+    candidate_directions = (
+        (
+            tangent_x * preferred_side
+            + away_x * INACTIVITY_AWAY_FROM_BALL_BIAS,
+            tangent_y * preferred_side
+            + away_y * INACTIVITY_AWAY_FROM_BALL_BIAS,
+        ),
+        (
+            -tangent_x * preferred_side
+            + away_x * INACTIVITY_AWAY_FROM_BALL_BIAS,
+            -tangent_y * preferred_side
+            + away_y * INACTIVITY_AWAY_FROM_BALL_BIAS,
+        ),
+        (away_x, away_y),
+    )
+
+    current_ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    safe_candidates: list[tuple[float, float]] = []
+    for direction_x, direction_y in candidate_directions:
+        direction_length = math.hypot(direction_x, direction_y)
+        if direction_length <= 1e-6:
+            continue
+        preferred_target = (
+            pose.x
+            + direction_x / direction_length * INACTIVITY_NUDGE_DISTANCE_M,
+            pose.y
+            + direction_y / direction_length * INACTIVITY_NUDGE_DISTANCE_M,
+        )
+        safe_target = _constrain_inactivity_target(
+            context,
+            preferred_target,
+            phase,
+        )
+        if safe_target is None:
+            continue
+        target_displacement = dist(
+            pose.x,
+            pose.y,
+            safe_target[0],
+            safe_target[1],
+        )
+        target_ball_distance = dist(
+            safe_target[0],
+            safe_target[1],
+            ball.x,
+            ball.y,
+        )
+        if (
+            target_displacement >= INACTIVITY_MIN_TARGET_DISPLACEMENT_M
+            and target_ball_distance >= current_ball_distance
+        ):
+            safe_candidates.append(safe_target)
+
+    if not safe_candidates:
+        return None
+    return max(
+        safe_candidates,
+        key=lambda candidate: (
+            dist(candidate[0], candidate[1], ball.x, ball.y),
+            dist(pose.x, pose.y, candidate[0], candidate[1]),
+        ),
+    )
+
+
+def _get_goalkeeper_inactivity_target(
+    context: Context,
+    goalkeeper: Player,
+    phase: Phase,
+    store,
+) -> tuple[float, float] | None:
+    """守门员仅围绕当前门前职责目标做很小的横向重新站位。"""
+    pose = goalkeeper.pose
+    ball = context.ball
+    if pose is None or ball is None:
+        return None
+
+    base_target = getattr(store, "goalkeeper_target", None)
+    if base_target is None:
+        base_target = own_goal_area_center(context)
+    lateral_limit = _goalkeeper_safe_lateral_limit(context)
+    preferred_side = 1.0 if goalkeeper.id % 2 == 0 else -1.0
+    candidate_sides = (preferred_side, -preferred_side)
+    current_ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    safe_candidates: list[tuple[float, float]] = []
+
+    for candidate_side in candidate_sides:
+        target_x = clamp(
+            base_target[0],
+            pose.x - INACTIVITY_GOALKEEPER_LONGITUDINAL_ADJUSTMENT_M,
+            pose.x + INACTIVITY_GOALKEEPER_LONGITUDINAL_ADJUSTMENT_M,
+        )
+        preferred_target = (
+            target_x,
+            clamp(
+                pose.y
+                + candidate_side * INACTIVITY_GOALKEEPER_NUDGE_DISTANCE_M,
+                -lateral_limit,
+                lateral_limit,
+            ),
+        )
+        safe_target = _constrain_inactivity_target(
+            context,
+            preferred_target,
+            phase,
+        )
+        if safe_target is None:
+            continue
+        target_displacement = dist(
+            pose.x,
+            pose.y,
+            safe_target[0],
+            safe_target[1],
+        )
+        target_ball_distance = dist(
+            safe_target[0],
+            safe_target[1],
+            ball.x,
+            ball.y,
+        )
+        if (
+            target_displacement >= INACTIVITY_MIN_TARGET_DISPLACEMENT_M
+            and target_ball_distance >= current_ball_distance
+        ):
+            safe_candidates.append(safe_target)
+
+    if not safe_candidates:
+        return None
+    return max(
+        safe_candidates,
+        key=lambda candidate: dist(
+            candidate[0], candidate[1], ball.x, ball.y,
+        ),
+    )
+
+
+def _inactivity_override_is_protected(
+    player: Player,
+    current_goalkeeper: Player | None,
+    phase: Phase,
+    store,
+) -> bool:
+    """不覆盖主罚、追球、踢球和守门员紧急响应。"""
+    if player.is_kicking:
+        return True
+    if (
+        phase == Phase.OUR_KICKOFF
+        and player.id == getattr(store, "kickoff_taker", None)
+    ):
+        return True
+
+    latest_assignment = getattr(
+        store,
+        "latest_open_play_role_assignment",
+        None,
+    )
+    if (
+        phase == Phase.OUR_SET_PLAY
+        and latest_assignment is not None
+        and player.id == latest_assignment.primary_attacker_id
+    ):
+        return True
+
+    if current_goalkeeper is not None and player.id == current_goalkeeper.id:
+        goalkeeper_mode = getattr(store, "goalkeeper_mode", None)
+        if goalkeeper_mode in (
+            GoalkeeperMode.BLOCK,
+            GoalkeeperMode.CHALLENGE,
+            GoalkeeperMode.CLEAR,
+            GoalkeeperMode.RETURN,
+        ):
+            return True
+
+    protected_action_prefixes = (
+        "attack:",
+        "normal:primary_attacker:",
+        "defense:pressure:",
+        "contested:challenge:",
+        "ball_search:",
+    )
+    return player.action.startswith(protected_action_prefixes)
+
+
+def _get_inactivity_action_label(
+    player: Player,
+    current_goalkeeper: Player | None,
+    phase: Phase,
+) -> str:
+    if current_goalkeeper is not None and player.id == current_goalkeeper.id:
+        return "inactivity_prevention:goalkeeper"
+    if phase in (Phase.OPP_KICKOFF, Phase.OPP_SET_PLAY):
+        return "inactivity_prevention:opp_restart"
+    if phase == Phase.OUR_KICKOFF:
+        return "inactivity_prevention:kickoff_support"
+    return "inactivity_prevention:normal"
+
+
+def _cancel_active_inactivity_nudge(
+    state: InactivityPreventionState,
+    now: float,
+) -> None:
+    _clear_inactivity_nudge(state)
+    state.cooldown_until = now + INACTIVITY_NUDGE_COOLDOWN_SEC
+
+
+def _active_inactivity_target_needs_replacement(
+    context: Context,
+    player: Player,
+    state: InactivityPreventionState,
+    current_goalkeeper: Player | None,
+    phase: Phase,
+) -> bool:
+    """阶段、职责或球位变化后重新生成目标,不沿用旧规则环境下的点。"""
+    target = state.nudge_target
+    if target is None or state.nudge_phase != phase:
+        return True
+    expected_action = _get_inactivity_action_label(
+        player,
+        current_goalkeeper,
+        phase,
+    )
+    if state.nudge_action != expected_action:
+        return True
+
+    constrained_target = _constrain_inactivity_target(
+        context,
+        target,
+        phase,
+    )
+    if constrained_target is None or constrained_target != target:
+        return True
+    ball = context.ball
+    pose = player.pose
+    return (
+        ball is not None
+        and pose is not None
+        and dist(target[0], target[1], ball.x, ball.y)
+        < dist(pose.x, pose.y, ball.x, ball.y)
+    )
+
+
+def _apply_inactivity_prevention(
+    context: Context,
+    players: list[Player],
+    available_players: list[Player],
+    current_goalkeeper: Player | None,
+    phase: Phase,
+    store,
+) -> None:
+    """策略分派后至多覆盖一名真正长期静止的机器人做安全小位移。"""
+    eligible_player_ids = _update_inactivity_tracking(
+        context,
+        players,
+        store,
+    )
+    if not eligible_player_ids:
+        return
+
+    available_players_by_id = {
+        player.id: player for player in available_players
+    }
+    active_player_id = getattr(
+        store,
+        "inactivity_prevention_active_player_id",
+        None,
+    )
+    active_player = available_players_by_id.get(active_player_id)
+    if active_player is not None:
+        active_state = _get_inactivity_prevention_state(
+            store,
+            active_player.id,
+        )
+        nudge_timed_out = (
+            active_state.nudge_started_at is not None
+            and context.now - active_state.nudge_started_at
+            >= INACTIVITY_NUDGE_TIMEOUT_SEC
+        )
+        target_needs_replacement = _active_inactivity_target_needs_replacement(
+            context,
+            active_player,
+            active_state,
+            current_goalkeeper,
+            phase,
+        )
+        if target_needs_replacement or nudge_timed_out:
+            _cancel_active_inactivity_nudge(active_state, context.now)
+            store.inactivity_prevention_active_player_id = None
+            active_player = None
+        elif (
+            active_player.id not in eligible_player_ids
+            or not active_state.nudge_active
+            or active_state.nudge_target is None
+            or _inactivity_override_is_protected(
+                active_player,
+                current_goalkeeper,
+                phase,
+                store,
+            )
+        ):
+            _cancel_active_inactivity_nudge(active_state, context.now)
+            store.inactivity_prevention_active_player_id = None
+            active_player = None
+    elif active_player_id is not None:
+        state = _get_inactivity_prevention_state(store, active_player_id)
+        _cancel_active_inactivity_nudge(state, context.now)
+        store.inactivity_prevention_active_player_id = None
+
+    if active_player is None:
+        trigger_time = min(
+            INACTIVITY_PREVENTION_TRIGGER_SEC,
+            INACTIVITY_RULE_TIMEOUT_SEC,
+        )
+        candidates: list[tuple[bool, float, int, Player]] = []
+        for player in available_players:
+            if player.id not in eligible_player_ids:
+                continue
+            state = _get_inactivity_prevention_state(store, player.id)
+            window_started_at = state.stationary_window_started_at
+            if (
+                window_started_at is None
+                or context.now < state.cooldown_until
+                or _inactivity_override_is_protected(
+                    player,
+                    current_goalkeeper,
+                    phase,
+                    store,
+                )
+            ):
+                continue
+            stationary_duration = context.now - window_started_at
+            if stationary_duration >= trigger_time:
+                is_goalkeeper = (
+                    current_goalkeeper is not None
+                    and player.id == current_goalkeeper.id
+                )
+                candidates.append(
+                    (
+                        is_goalkeeper,
+                        -stationary_duration,
+                        player.id,
+                        player,
+                    )
+                )
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        for _is_goalkeeper, _negative_duration, _player_id, candidate in candidates:
+            if (
+                current_goalkeeper is not None
+                and candidate.id == current_goalkeeper.id
+            ):
+                target = _get_goalkeeper_inactivity_target(
+                    context,
+                    candidate,
+                    phase,
+                    store,
+                )
+            else:
+                target = _get_relative_inactivity_target(
+                    context,
+                    candidate,
+                    phase,
+                )
+            if target is None or candidate.pose is None:
+                continue
+
+            state = _get_inactivity_prevention_state(store, candidate.id)
+            state.nudge_active = True
+            state.nudge_target = target
+            state.nudge_start_position = (
+                candidate.pose.x,
+                candidate.pose.y,
+            )
+            state.nudge_started_at = context.now
+            state.nudge_action = _get_inactivity_action_label(
+                candidate,
+                current_goalkeeper,
+                phase,
+            )
+            state.nudge_phase = phase
+            store.inactivity_prevention_active_player_id = candidate.id
+            active_player = candidate
+            break
+
+    if active_player is None or active_player.pose is None:
+        return
+    active_state = _get_inactivity_prevention_state(
+        store,
+        active_player.id,
+    )
+    target = active_state.nudge_target
+    action = active_state.nudge_action
+    if target is None or action is None:
+        return
+
+    ball = context.ball
+    face = (
+        angle_to(
+            active_player.pose.x,
+            active_player.pose.y,
+            ball.x,
+            ball.y,
+        )
+        if ball is not None else None
+    )
+    arrived = active_player.walk_to(
+        target,
+        face=face,
+        avoid_ball=True,
+        avoid_robots=True,
+        arrive_dist=INACTIVITY_NUDGE_ARRIVE_DISTANCE_M,
+    )
+    active_player.action = action
+    if arrived:
+        current_position = (
+            active_player.pose.x,
+            active_player.pose.y,
+        )
+        _confirm_inactivity_movement(
+            active_state,
+            current_position,
+            context.now,
+        )
+        store.inactivity_prevention_active_player_id = None
 
 
 def _resolve_default_goalkeeper_id(
