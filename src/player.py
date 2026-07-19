@@ -515,6 +515,17 @@ class Player:
                     selected_clearance = _heading_clearance(
                         pose.x, pose.y, heading, obstacles,
                     )
+                    if selected_clearance < PLAN_CLEARANCE:
+                        # A valid global path can still start with a locally
+                        # constrained heading. Use VFH only when it improves
+                        # the immediate clearance.
+                        local_heading, local_clearance = self._plan_heading(
+                            pose, goal_dir, obstacles,
+                        )
+                        if local_clearance > selected_clearance:
+                            heading = local_heading
+                            selected_clearance = local_clearance
+                            waypoint = None
                 else:
                     heading, selected_clearance = self._plan_heading(
                         pose, goal_dir, obstacles,
@@ -627,19 +638,25 @@ class Player:
     def _path_waypoint(
         self, pose: Pose2D, path: list[tuple[float, float]],
     ) -> tuple[float, float]:
-        """Pick a short lookahead waypoint from a planned global path."""
+        """Pick a waypoint by consuming lookahead along the planned path."""
         if not path:
             return (pose.x, pose.y)
+
+        remaining_lookahead = GLOBAL_PATH_LOOKAHEAD_M
         prev = (pose.x, pose.y)
         points = path[1:] if len(path) > 1 else path
         for point in points:
             seg_len = dist(prev[0], prev[1], point[0], point[1])
-            if seg_len >= GLOBAL_PATH_LOOKAHEAD_M:
-                ratio = GLOBAL_PATH_LOOKAHEAD_M / max(seg_len, 1e-6)
+            if seg_len <= 1e-6:
+                prev = point
+                continue
+            if seg_len >= remaining_lookahead:
+                ratio = remaining_lookahead / seg_len
                 return (
                     prev[0] + (point[0] - prev[0]) * ratio,
                     prev[1] + (point[1] - prev[1]) * ratio,
                 )
+            remaining_lookahead -= seg_len
             prev = point
         return path[-1]
 

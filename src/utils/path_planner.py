@@ -35,6 +35,18 @@ def plan_global_path(
     if start_idx == goal_idx:
         return [(tx, ty)]
 
+    start_point = (sx, sy)
+    start_overlaps = _containing_obstacles(sx, sy, obstacles)
+    goal_grid_point = _to_xy(goal_idx, min_x, min_y)
+    # Preserve the existing blocked-goal endpoint policy while checking the
+    # final edge against every obstacle that does not contain the goal.
+    goal_overlaps = _merge_obstacles(
+        _containing_obstacles(tx, ty, obstacles),
+        _containing_obstacles(
+            goal_grid_point[0], goal_grid_point[1], obstacles,
+        ),
+    )
+
     open_heap: list[tuple[float, int, tuple[int, int]]] = []
     counter = 0
     heapq.heappush(open_heap, (0.0, counter, start_idx))
@@ -58,6 +70,42 @@ def plan_global_path(
                 neighbor != start_idx
                 and neighbor != goal_idx
                 and _blocked(x, y, obstacles)
+            ):
+                continue
+
+            current_point = (
+                start_point
+                if current == start_idx
+                else _to_xy(current, min_x, min_y)
+            )
+            ignored_obstacles = goal_overlaps if neighbor == goal_idx else []
+            if current == start_idx and start_overlaps:
+                # The first edge may leave an existing overlap, but it must
+                # move outward from every obstacle that contains the start.
+                if not _moves_outward_from_overlaps(
+                    current_point, (x, y), start_overlaps,
+                ):
+                    continue
+                ignored_obstacles = _merge_obstacles(
+                    ignored_obstacles, start_overlaps,
+                )
+            if (
+                neighbor != goal_idx
+                and _diagonal_corner_blocked(
+                    current,
+                    neighbor,
+                    min_x,
+                    min_y,
+                    obstacles,
+                    ignored_obstacles,
+                )
+            ):
+                continue
+            if _edge_blocked(
+                current_point,
+                (x, y),
+                obstacles,
+                ignored_obstacles,
             ):
                 continue
             tentative = g_score[current] + step_cost
@@ -118,10 +166,141 @@ def _neighbors(idx: tuple[int, int]) -> list[tuple[tuple[int, int], float]]:
 
 
 def _blocked(x: float, y: float, obstacles: list[Obstacle]) -> bool:
-    for obs in obstacles:
-        if math.hypot(x - obs.x, y - obs.y) <= obs.radius + GLOBAL_OBSTACLE_MARGIN_M:
+    return _blocked_except(x, y, obstacles, [])
+
+
+def _blocked_except(
+    x: float,
+    y: float,
+    obstacles: list[Obstacle],
+    ignored_obstacles: list[Obstacle],
+) -> bool:
+    for obstacle in obstacles:
+        if obstacle in ignored_obstacles:
+            continue
+        obstacle_distance = math.hypot(x - obstacle.x, y - obstacle.y)
+        inflated_radius = obstacle.radius + GLOBAL_OBSTACLE_MARGIN_M
+        if obstacle_distance <= inflated_radius:
             return True
     return False
+
+
+def _containing_obstacles(
+    x: float,
+    y: float,
+    obstacles: list[Obstacle],
+) -> list[Obstacle]:
+    return [
+        obstacle
+        for obstacle in obstacles
+        if math.hypot(x - obstacle.x, y - obstacle.y)
+        <= obstacle.radius + GLOBAL_OBSTACLE_MARGIN_M
+    ]
+
+
+def _merge_obstacles(
+    first: list[Obstacle],
+    second: list[Obstacle],
+) -> list[Obstacle]:
+    merged = list(first)
+    for obstacle in second:
+        if obstacle not in merged:
+            merged.append(obstacle)
+    return merged
+
+
+def _diagonal_corner_blocked(
+    current: tuple[int, int],
+    neighbor: tuple[int, int],
+    min_x: float,
+    min_y: float,
+    obstacles: list[Obstacle],
+    ignored_obstacles: list[Obstacle],
+) -> bool:
+    step_x = neighbor[0] - current[0]
+    step_y = neighbor[1] - current[1]
+    if step_x == 0 or step_y == 0:
+        return False
+
+    horizontal = _to_xy(
+        (current[0] + step_x, current[1]), min_x, min_y,
+    )
+    vertical = _to_xy(
+        (current[0], current[1] + step_y), min_x, min_y,
+    )
+    return (
+        _blocked_except(
+            horizontal[0], horizontal[1], obstacles, ignored_obstacles,
+        )
+        or _blocked_except(
+            vertical[0], vertical[1], obstacles, ignored_obstacles,
+        )
+    )
+
+
+def _moves_outward_from_overlaps(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    overlapping_obstacles: list[Obstacle],
+) -> bool:
+    movement_x = end[0] - start[0]
+    movement_y = end[1] - start[1]
+    for obstacle in overlapping_obstacles:
+        start_offset_x = start[0] - obstacle.x
+        start_offset_y = start[1] - obstacle.y
+        start_distance = math.hypot(start_offset_x, start_offset_y)
+        end_distance = math.hypot(end[0] - obstacle.x, end[1] - obstacle.y)
+        if end_distance <= start_distance + 1e-9:
+            return False
+        if start_distance > 1e-9:
+            outward_progress = (
+                start_offset_x * movement_x
+                + start_offset_y * movement_y
+            )
+            if outward_progress <= 0.0:
+                return False
+    return True
+
+
+def _edge_blocked(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    obstacles: list[Obstacle],
+    ignored_obstacles: list[Obstacle],
+) -> bool:
+    for obstacle in obstacles:
+        if obstacle in ignored_obstacles:
+            continue
+        edge_clearance = _point_to_segment_distance(
+            (obstacle.x, obstacle.y), start, end,
+        )
+        if edge_clearance <= obstacle.radius + GLOBAL_OBSTACLE_MARGIN_M:
+            return True
+    return False
+
+
+def _point_to_segment_distance(
+    point: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> float:
+    segment_x = segment_end[0] - segment_start[0]
+    segment_y = segment_end[1] - segment_start[1]
+    segment_length_squared = segment_x * segment_x + segment_y * segment_y
+    if segment_length_squared <= 1e-12:
+        return math.hypot(
+            point[0] - segment_start[0],
+            point[1] - segment_start[1],
+        )
+
+    projection = (
+        (point[0] - segment_start[0]) * segment_x
+        + (point[1] - segment_start[1]) * segment_y
+    ) / segment_length_squared
+    projection = max(0.0, min(1.0, projection))
+    nearest_x = segment_start[0] + segment_x * projection
+    nearest_y = segment_start[1] + segment_y * projection
+    return math.hypot(point[0] - nearest_x, point[1] - nearest_y)
 
 
 def _heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
