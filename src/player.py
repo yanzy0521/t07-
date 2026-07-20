@@ -266,10 +266,13 @@ class Player:
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
-    def plan_offensive_shot(self) -> tuple[float, float] | None:
+    def plan_offensive_shot(
+        self,
+        kick_target: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
         """计算 offensive striker 的射门方向和力度。
 
-        从当前球位踢向对方球门中心，并使用独立的进攻射门力度。
+        从当前球位踢向动态进攻目标，并使用独立的进攻射门力度。
         返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
         """
         ctx = self.context
@@ -277,9 +280,9 @@ class Player:
         if ctx is None or ball is None:
             return None
 
-        kick_target = opponent_goal(ctx)
+        if kick_target is None:
+            kick_target = self._dynamic_offensive_kick_target()
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_target = self._goal_target_for_direction(kick_direction)
         kick_power = (
             OFFENSIVE_STRIKER_BACKFIELD_KICK_POWER
             if self._in_backfield()
@@ -353,6 +356,60 @@ class Player:
             and alignment_error
             <= OFFENSIVE_STRIKER_SOFT_DRIBBLE_MAX_ALIGNMENT_RAD
         )
+
+    def _dynamic_offensive_kick_target(self) -> tuple[float, float]:
+        """根据球的横向偏移选择瞄门、带正或极偏快速处理目标。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None:
+            return (0.0, 0.0)
+
+        opponent_goal_line_x = context.field.length / 2.0
+        half_field_width = max(
+            0.0,
+            context.field.width / 2.0
+            - OFFENSIVE_STRIKER_SHOT_FIELD_MARGIN_M,
+        )
+        absolute_ball_y = abs(ball.y)
+        lateral_sign = 1.0 if ball.y >= 0.0 else -1.0
+        straight_lateral_limit = (
+            context.field.goal_width / 2.0
+            + OFFENSIVE_STRIKER_SHOT_STRAIGHT_LATERAL_MARGIN_M
+        )
+        if absolute_ball_y <= straight_lateral_limit:
+            return opponent_goal(context)
+
+        in_extreme_corner = (
+            ball.x
+            >= opponent_goal_line_x - OFFENSIVE_STRIKER_SHOT_EXTREME_CORNER_X_M
+            and absolute_ball_y
+            >= half_field_width
+            - OFFENSIVE_STRIKER_SHOT_EXTREME_TOUCHLINE_MARGIN_M
+        )
+        if in_extreme_corner:
+            return (
+                opponent_goal_line_x,
+                clamp(ball.y, -half_field_width, half_field_width),
+            )
+
+        adjust_lateral_limit = (
+            straight_lateral_limit
+            + OFFENSIVE_STRIKER_SHOT_ADJUST_LATERAL_BAND_M
+        )
+        if absolute_ball_y <= adjust_lateral_limit:
+            adjusted_target_x = min(
+                opponent_goal_line_x,
+                ball.x + OFFENSIVE_STRIKER_SHOT_ADJUST_FORWARD_DISTANCE_M,
+            )
+            adjusted_target_y = lateral_sign * clamp(
+                absolute_ball_y
+                - OFFENSIVE_STRIKER_SHOT_ADJUST_INFIELD_DISTANCE_M,
+                0.0,
+                straight_lateral_limit,
+            )
+            return (adjusted_target_x, adjusted_target_y)
+
+        return opponent_goal(context)
 
     def _chase_ball_aggressively(self) -> None:
         """以持续高速全向压迫球点，不执行通用走位的减速或转向等待。"""
@@ -1006,7 +1063,7 @@ class Player:
             self.stop()
             return
         if kick_target is None:
-            kick_target = opponent_goal(self.context)
+            kick_target = self._dynamic_offensive_kick_target()
 
         d = dist(self.pose.x, self.pose.y, ball.x, ball.y)
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
@@ -1033,7 +1090,7 @@ class Player:
         )
         if self._kicking:
             self._reset_ball_approach()
-            kick_plan = self.plan_offensive_shot()
+            kick_plan = self.plan_offensive_shot(kick_target)
             if kick_plan is None:
                 self.stop()
                 return
@@ -1041,7 +1098,7 @@ class Player:
             self.kick(kick_direction, kick_power)
         elif self._should_disrupt_close_contest(d):
             self._reset_ball_approach()
-            kick_plan = self.plan_offensive_shot()
+            kick_plan = self.plan_offensive_shot(kick_target)
             if kick_plan is None:
                 self.stop()
                 return
