@@ -3394,8 +3394,13 @@ def _constrain_throw_in_target(
     )
     forward_progress = target[0] - origin[0]
     infield_progress = (target[1] - origin[1]) * infield_y_direction
+    available_forward_space = max(0.0, half_length - origin[0])
+    required_forward_progress = min(
+        THROW_IN_MIN_FORWARD_PROGRESS_M,
+        available_forward_space,
+    )
     if (
-        forward_progress < THROW_IN_MIN_FORWARD_PROGRESS_M
+        forward_progress < required_forward_progress
         or infield_progress < THROW_IN_MIN_INFIELD_PROGRESS_M
     ):
         return None
@@ -3760,11 +3765,11 @@ def _build_throw_in_plan(
         return None, "ball_unavailable"
 
     origin = (ball.x, ball.y)
-    half_width = context.field.width / 2.0
-    touchline_distance = abs(half_width - abs(origin[1]))
-    if touchline_distance > THROW_IN_TOUCHLINE_TOLERANCE_M:
-        return None, "ball_not_near_touchline"
-
+    # GameController is the rule authority for THROW_IN. The local ball estimate
+    # can be pulled inside by vision/localization while the referee context is
+    # already executable; rejecting that estimate makes the team wait forever.
+    # Use the observed restart point directly and only use its lateral sign to
+    # choose which way is infield.
     infield_y_direction = -1.0 if origin[1] >= 0.0 else 1.0
     region = _classify_throw_in_region(context, origin[0])
     opponent_positions = _get_valid_opponent_positions(context)
@@ -4584,6 +4589,19 @@ def _act_consumed_throw_in_fallback(
 ) -> None:
     """同一界外球已结束时保持安全站位，绝不重新进入固定流程。"""
     _draw_throw_in_status(context, store)
+    if getattr(store, "throw_in_last_outcome", None) == ThrowInStage.ABORTED.value:
+        # 固定套路失败后不能在同一个裁判上下文里永久停车，否则一次走位或
+        # 触球失败就会表现为“界外球不会开”。降级为普通近球处理，仍然只在
+        # GameController 明确给我方 THROW_IN 的 Phase 内触发。
+        _act_normal(
+            context,
+            players,
+            goalkeeper,
+            store,
+            allow_ball_search=False,
+        )
+        return
+
     field_players = [player for player in players if player is not goalkeeper]
     _guard_throw_in_goalkeeper(
         context,
