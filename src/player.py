@@ -411,6 +411,36 @@ class Player:
 
         return opponent_goal(context)
 
+    def _offensive_shot_alignment_limit(
+        self,
+        *,
+        currently_kicking: bool,
+    ) -> float:
+        """近/中距离放宽射门，远距离保持更严格的球路质量。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None:
+            return (
+                OFFENSIVE_STRIKER_DIRECT_EXIT_ANGLE_RAD
+                if currently_kicking
+                else OFFENSIVE_STRIKER_DIRECT_ENTER_ANGLE_RAD
+            )
+
+        opponent_goal_line_x = context.field.length / 2.0
+        distance_to_opponent_goal = max(0.0, opponent_goal_line_x - ball.x)
+        if distance_to_opponent_goal > OFFENSIVE_STRIKER_FAR_SHOT_GOAL_DISTANCE_M:
+            return (
+                OFFENSIVE_STRIKER_FAR_SHOT_EXIT_ANGLE_RAD
+                if currently_kicking
+                else OFFENSIVE_STRIKER_FAR_SHOT_ENTER_ANGLE_RAD
+            )
+
+        return (
+            OFFENSIVE_STRIKER_RELAXED_SHOT_EXIT_ANGLE_RAD
+            if currently_kicking
+            else OFFENSIVE_STRIKER_RELAXED_SHOT_ENTER_ANGLE_RAD
+        )
+
     def _chase_ball_aggressively(self) -> None:
         """以持续高速全向压迫球点，不执行通用走位的减速或转向等待。"""
         context = self.context
@@ -1079,10 +1109,8 @@ class Player:
             if self._kicking
             else OFFENSIVE_STRIKER_KICK_ENTER_M
         )
-        kick_alignment_limit = (
-            OFFENSIVE_STRIKER_DIRECT_EXIT_ANGLE_RAD
-            if self._kicking
-            else OFFENSIVE_STRIKER_DIRECT_ENTER_ANGLE_RAD
+        kick_alignment_limit = self._offensive_shot_alignment_limit(
+            currently_kicking=self._kicking,
         )
         self._kicking = (
             d <= kick_distance_limit
