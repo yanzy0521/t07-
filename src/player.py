@@ -304,6 +304,30 @@ class Player:
         self._draw_kick_target(tackle_target)
         return tackle_direction, DEFENSIVE_PRESSER_TACKLE_POWER
 
+    def _nearest_opponent_distance_to_ball(self) -> float | None:
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None:
+            return None
+
+        opponent_distances = [
+            dist(opponent.pose.x, opponent.pose.y, ball.x, ball.y)
+            for opponent in context.opponents.values()
+            if opponent.pose is not None
+        ]
+        if not opponent_distances:
+            return None
+        return min(opponent_distances)
+
+    def _should_disrupt_close_contest(self, ball_distance: float) -> bool:
+        nearest_opponent_distance = self._nearest_opponent_distance_to_ball()
+        return (
+            ball_distance <= OFFENSIVE_STRIKER_DISRUPT_DISTANCE_M
+            and nearest_opponent_distance is not None
+            and nearest_opponent_distance
+            <= OFFENSIVE_STRIKER_DISRUPT_OPPONENT_DISTANCE_M
+        )
+
     def _chase_ball_aggressively(self) -> None:
         """以持续高速全向压迫球点，不执行通用走位的减速或转向等待。"""
         context = self.context
@@ -989,6 +1013,15 @@ class Player:
                 return
             kick_direction, kick_power = kick_plan
             self.kick(kick_direction, kick_power)
+        elif self._should_disrupt_close_contest(d):
+            self._reset_ball_approach()
+            kick_plan = self.plan_offensive_shot()
+            if kick_plan is None:
+                self.stop()
+                return
+            kick_direction, _kick_power = kick_plan
+            self.kick(kick_direction, OFFENSIVE_STRIKER_DISRUPT_POWER)
+            self.action = "offensive_striker:disrupt"
         else:
             self.release_kick()
             approach_target, kick_direction = self._ball_approach_target(

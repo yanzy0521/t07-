@@ -69,6 +69,11 @@ OFFENSIVE_STRIKER_CIRCLE_PROGRESS_RAD = math.radians(5.0)
 OFFENSIVE_STRIKER_CIRCLE_TIMEOUT_SEC = 1.5
 OFFENSIVE_STRIKER_CIRCLE_FALLBACK_SEC = 0.5
 
+# 对手也贴近球时，不再为了完美球后位后撤，优先低力度朝对方球门破坏球。
+OFFENSIVE_STRIKER_DISRUPT_DISTANCE_M = 0.90
+OFFENSIVE_STRIKER_DISRUPT_OPPONENT_DISTANCE_M = 1.20
+OFFENSIVE_STRIKER_DISRUPT_POWER = 4.0
+
 
 # ======================================================================
 # Player 技术动作参数：守门 / 支援 
