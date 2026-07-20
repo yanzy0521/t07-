@@ -218,7 +218,16 @@ def get_phase(context: Context) -> Phase:
         # 定位球:set_play != NONE,kicking_team 指示哪方
         if g.set_play != SetPlay.NONE and g.kicking_team != KICKING_TEAM_NONE:
             our_team = context.team_id
-            if g.kicking_team == our_team:
+            if (
+                g.kicking_team == our_team
+                or (
+                    g.set_play == SetPlay.THROW_IN
+                    and _game_controller_team_matches_us(
+                        g.kicking_team,
+                        our_team,
+                    )
+                )
+            ):
                 return Phase.OUR_SET_PLAY
             else:
                 return Phase.OPP_SET_PLAY
@@ -3184,8 +3193,16 @@ def _is_our_throw_in_context(context: Context) -> bool:
         and game.state == GameState.PLAYING
         and not game.stopped
         and game.set_play == SetPlay.THROW_IN
-        and game.kicking_team == context.team_id
+        and _game_controller_team_matches_us(game.kicking_team, context.team_id)
     )
+
+
+def _game_controller_team_matches_us(
+    kicking_team: int,
+    team_id: int,
+) -> bool:
+    """兼容裁判机 1/2 队号与 Challenger/Booster 0/1 编码。"""
+    return kicking_team == team_id or kicking_team == team_id - 1
 
 
 def _finish_throw_in_tactic(
@@ -4137,6 +4154,12 @@ def _act_throw_in_positioning(
         state.kicker_stage_target[0],
         state.kicker_stage_target[1],
     ) <= THROW_IN_KICKER_READY_DISTANCE_M
+    kicker_ball_ready = dist(
+        kicker.pose.x,
+        kicker.pose.y,
+        ball.x,
+        ball.y,
+    ) <= THROW_IN_KICKER_STAGE_DISTANCE_M
     kicker_heading_ready = abs(normalize_angle(
         kick_direction - kicker.pose.theta,
     )) <= THROW_IN_KICKER_READY_HEADING_RAD
@@ -4166,7 +4189,7 @@ def _act_throw_in_positioning(
     heading_ready_enough = kicker_heading_ready or heading_wait_expired
     receiver_ready_enough = receiver_ready or receiver_wait_expired
     should_start_kick = (
-        kicker_position_ready
+        (kicker_position_ready or kicker_ball_ready)
         and heading_ready_enough
         and receiver_ready_enough
     )
@@ -4185,7 +4208,7 @@ def _act_throw_in_positioning(
         _abort_throw_in(players, store, "positioning_timeout")
         return
 
-    if not kicker_position_ready:
+    if not kicker_position_ready and not kicker_ball_ready:
         kicker.action = (
             "throw_in:solo:position"
             if solo
