@@ -272,7 +272,7 @@ class Player:
     ) -> tuple[float, float] | None:
         """计算 offensive striker 的射门方向和力度。
 
-        从当前球位踢向动态进攻目标，并使用独立的进攻射门力度。
+        从当前球位踢向动态进攻目标，并按球到对方球门距离动态调整力度。
         返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
         """
         ctx = self.context
@@ -283,14 +283,31 @@ class Player:
         if kick_target is None:
             kick_target = self._dynamic_offensive_kick_target()
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_power = (
-            OFFENSIVE_STRIKER_BACKFIELD_KICK_POWER
-            if self._in_backfield()
-            else OFFENSIVE_STRIKER_KICK_POWER
-        )
+        kick_power = self._dynamic_offensive_shot_power()
 
         self._draw_kick_target(kick_target)
         return kick_direction, kick_power
+
+    def _dynamic_offensive_shot_power(self) -> float:
+        """按球到对方球门的距离线性调整普通进攻射门力度。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if context is None or ball is None:
+            return OFFENSIVE_STRIKER_SHOT_POWER_MIN
+
+        opponent_goal_line_x = context.field.length / 2.0
+        distance_to_opponent_goal = max(0.0, opponent_goal_line_x - ball.x)
+        distance_ratio = clamp(
+            distance_to_opponent_goal
+            / OFFENSIVE_STRIKER_SHOT_POWER_FULL_DISTANCE_M,
+            0.0,
+            1.0,
+        )
+        power_range = (
+            OFFENSIVE_STRIKER_SHOT_POWER_MAX
+            - OFFENSIVE_STRIKER_SHOT_POWER_MIN
+        )
+        return OFFENSIVE_STRIKER_SHOT_POWER_MIN + power_range * distance_ratio
 
     def plan_defensive_clear(self) -> tuple[float, float] | None:
         """计算 defensive presser 的快速低力度向前抢断。"""

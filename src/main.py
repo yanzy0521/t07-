@@ -3345,12 +3345,17 @@ def _clamp_our_kickoff_target(
     )
 
 
+def _get_our_kickoff_fixed_origin() -> tuple[float, float]:
+    """中场开球战术的硬性站位原点：场地中心，不读取当前球位。"""
+    return (0.0, 0.0)
+
+
 def _build_our_kickoff_geometry(
     context: Context,
     origin: tuple[float, float],
     side: float,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-    """由球位生成图中固定开球站位：两名前场都在我方半场。"""
+    """由固定中点生成图中硬性开球站位：两名前场都在我方半场。"""
     passer_target = _clamp_our_kickoff_target(
         context,
         (
@@ -3379,6 +3384,29 @@ def _get_our_kickoff_direction(
     if length <= 1e-6:
         return (1.0, 0.0)
     return (delta_x / length, delta_y / length)
+
+
+def _get_our_kickoff_receive_foot_target(
+    context: Context,
+    origin: tuple[float, float],
+    receiver_target: tuple[float, float],
+    side: float,
+) -> tuple[float, float]:
+    """传向接应点前方；横向脚位偏置默认关闭，避免固定单侧偏差。"""
+    pass_direction = _get_our_kickoff_direction(origin, receiver_target)
+    perpendicular_x = -pass_direction[1]
+    perpendicular_y = pass_direction[0]
+    return _clamp_our_kickoff_target(
+        context,
+        (
+            receiver_target[0]
+            - pass_direction[0] * OUR_KICKOFF_PASS_TARGET_FORWARD_BIAS_M
+            + perpendicular_x * side * OUR_KICKOFF_RECEIVER_FOOT_LATERAL_OFFSET_M,
+            receiver_target[1]
+            - pass_direction[1] * OUR_KICKOFF_PASS_TARGET_FORWARD_BIAS_M
+            + perpendicular_y * side * OUR_KICKOFF_RECEIVER_FOOT_LATERAL_OFFSET_M,
+        ),
+    )
 
 
 def _select_our_kickoff_roles_and_side(
@@ -3474,7 +3502,8 @@ def _try_initialize_our_kickoff_tactic(
         )
         return False
 
-    origin = (ball.x, ball.y)
+    fixed_origin = _get_our_kickoff_fixed_origin()
+    actual_ball_origin = (ball.x, ball.y)
     try:
         (
             passer,
@@ -3483,7 +3512,11 @@ def _try_initialize_our_kickoff_tactic(
             passer_target,
             receiver_target,
             pass_target,
-        ) = _select_our_kickoff_roles_and_side(context, field_players, origin)
+        ) = _select_our_kickoff_roles_and_side(
+            context,
+            field_players,
+            fixed_origin,
+        )
     except ValueError:
         _consume_our_kickoff_context_without_tactic(
             store,
@@ -3491,21 +3524,21 @@ def _try_initialize_our_kickoff_tactic(
         )
         return False
 
-    # 接应人按图片站位只原地面向球，不由固定程序移动；传球目标锁定到
-    # 接应人当前脚下，确保开球人第一脚只做定向传球。
+    # 接应人按图片站位；传球瞄侧前方脚位，避免直接打身体中心。
     if receiver.pose is None:
         _consume_our_kickoff_context_without_tactic(
             store,
             "receiver_pose_unavailable",
         )
         return False
-    receiver_target = _clamp_our_kickoff_target(
+    pass_target = _get_our_kickoff_receive_foot_target(
         context,
-        (receiver.pose.x, receiver.pose.y),
+        fixed_origin,
+        receiver_target,
+        side,
     )
-    pass_target = receiver_target
 
-    pass_direction = _get_our_kickoff_direction(origin, pass_target)
+    pass_direction = _get_our_kickoff_direction(actual_ball_origin, pass_target)
     store.active_tactic = "our_kickoff"
     store.locked_roles = frozenset((passer.id, receiver.id))
     store.tactic_roles = OurKickoffRoleAssignment(
@@ -3519,7 +3552,7 @@ def _try_initialize_our_kickoff_tactic(
         stage=OurKickoffStage.POSITIONING,
         started_at=context.now,
         stage_started_at=context.now,
-        origin=origin,
+        origin=actual_ball_origin,
         side=side,
         passer_target=passer_target,
         receiver_target=receiver_target,
@@ -3699,27 +3732,63 @@ def _run_our_kickoff_tactic(
             ball.x,
             ball.y,
         )
-        if passer_ball_distance > OUR_KICKOFF_PASSER_TOUCH_DISTANCE_M:
-            # 图中站位是准备位，不是触球位；开球后必须先靠近球，否则 kick
-            # manager 只会收到命令但球不在脚边，实际不会形成第一脚传球。
-            approach_target = _clamp_our_kickoff_target(
-                context,
-                (
-                    ball.x - state.pass_direction[0]
-                    * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
-                    ball.y - state.pass_direction[1]
-                    * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
-                ),
+        pass_heading = angle_to(ball.x, ball.y, *state.pass_target)
+        approach_target = _clamp_our_kickoff_target(
+            context,
+            (
+                ball.x - state.pass_direction[0]
+                * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
+                ball.y - state.pass_direction[1]
+                * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
+            ),
+        )
+        passer_relative_x = passer.pose.x - ball.x
+        passer_relative_y = passer.pose.y - ball.y
+        passer_behind_distance = -(
+            passer_relative_x * state.pass_direction[0]
+            + passer_relative_y * state.pass_direction[1]
+        )
+        passer_lateral_error = abs(
+            passer_relative_x * state.pass_direction[1]
+            - passer_relative_y * state.pass_direction[0]
+        )
+        passer_heading_error = abs(normalize_angle(pass_heading - passer.pose.theta))
+        passer_close_enough_to_kick = (
+            passer_ball_distance <= OUR_KICKOFF_PASSER_TOUCH_DISTANCE_M
+        )
+        passer_final_alignment_ready = (
+            passer_behind_distance >= OUR_KICKOFF_PASSER_FINAL_BEHIND_MIN_M
+            and passer_lateral_error <= OUR_KICKOFF_PASSER_FINAL_LATERAL_TOLERANCE_M
+            and passer_heading_error <= OUR_KICKOFF_PASSER_FINAL_HEADING_TOLERANCE_RAD
+        )
+        final_adjustment_timed_out = (
+            context.now - state.stage_started_at
+            >= OUR_KICKOFF_PASSER_MAX_FINAL_ADJUST_SEC
+        )
+        should_keep_adjusting = (
+            not passer_close_enough_to_kick
+            or (
+                not passer_final_alignment_ready
+                and not final_adjustment_timed_out
             )
+        )
+        if should_keep_adjusting:
+            # 先贴近球并做短暂微调；微调超时后只要已经够近就放行踢球，
+            # 避免为了完美姿态把中场开球卡死。
             passer.release_kick()
             passer.walk_to(
                 approach_target,
-                face=angle_to(ball.x, ball.y, *state.pass_target),
+                face=pass_heading,
                 avoid_ball=False,
                 avoid_robots=True,
                 arrive_dist=OUR_KICKOFF_PASSER_APPROACH_ARRIVE_DISTANCE_M,
             )
-            passer.action = "kickoff:passer:approach_ball_to_pass"
+            if not passer_close_enough_to_kick:
+                passer.action = "kickoff:passer:approach_ball_to_pass"
+            elif passer_heading_error > OUR_KICKOFF_PASSER_FINAL_HEADING_TOLERANCE_RAD:
+                passer.action = "kickoff:passer:align_heading"
+            else:
+                passer.action = "kickoff:passer:align_ball_line"
             _stop_unassigned_kickoff_field_players(field_players, passer, receiver)
             return
 
@@ -3856,7 +3925,13 @@ def _act_our_kickoff_receiving(
         receiver.face_to(_receiver_face_angle_for_kickoff(receiver, state))
         receiver.action = "kickoff:receiver:received"
     else:
-        receiver.face_to(_receiver_face_angle_for_kickoff(receiver, state))
+        receiver.walk_to(
+            (ball.x, ball.y),
+            face=_receiver_face_angle_for_kickoff(receiver, state),
+            avoid_ball=False,
+            avoid_robots=True,
+            arrive_dist=OUR_KICKOFF_RECEIVER_BALL_DISTANCE_M,
+        )
         receiver.action = "kickoff:receiver:receive"
         _stop_unassigned_kickoff_field_players(field_players, passer, receiver)
 
@@ -6225,8 +6300,7 @@ def _act_ready_our_kickoff_shape(
         store.kickoff_taker = None
         return
 
-    ball = context.ball
-    origin = (ball.x, ball.y) if ball is not None else (0.0, 0.0)
+    origin = _get_our_kickoff_fixed_origin()
     if len(field_players) < 2:
         single_target = _clamp_our_kickoff_target(
             context,
