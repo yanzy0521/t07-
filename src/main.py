@@ -3072,7 +3072,7 @@ def _act_our_kickoff(
     goalkeeper: Player | None,
     store,
 ) -> None:
-    """OUR_KICKOFF:固定一传一接,第一脚只传接应人,不走射门入口。"""
+    """OUR_KICKOFF:固定一传一接，第一脚传向接应提前量，不走射门入口。"""
     if not players:
         return
 
@@ -3524,7 +3524,7 @@ def _try_initialize_our_kickoff_tactic(
         )
         return False
 
-    # 接应人按图片站位；传球瞄侧前方脚位，避免直接打身体中心。
+    # 固定站位不变；传球目标只在接应点附近给少量提前量，不改变开球人站位。
     if receiver.pose is None:
         _consume_our_kickoff_context_without_tactic(
             store,
@@ -3703,8 +3703,8 @@ def _run_our_kickoff_tactic(
         return
 
     if state.stage in (OurKickoffStage.POSITIONING, OurKickoffStage.READY_TO_PASS):
-        # READY 阶段完成图中准备站位；PLAYING 后进入强制传球流程。
-        # 若 passer 离球还远，PASSING 阶段会先贴近球再定向传给接应人。
+        # READY 阶段完成图中准备站位；PLAYING 后进入定向一脚传球。
+        # 若 passer 离球还远，PASSING 阶段会先贴近球再传给接应提前量。
         _advance_our_kickoff_stage(
             state,
             OurKickoffStage.PASSING,
