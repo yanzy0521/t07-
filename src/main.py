@@ -170,6 +170,16 @@ class ThrowInTacticState:
     terminal_reason: str | None = None
 
 
+_THROW_IN_TRANSIENT_INIT_FAILURES = frozenset(
+    {
+        "ball_not_near_touchline",
+        "no_valid_pass_target",
+        "no_valid_kicker_stage",
+        "ball_unavailable",
+    },
+)
+
+
 @dataclass
 class InactivityPreventionState:
     """单个机器人基于实际 pose 的 M-05 静止窗口和 nudge 状态。"""
@@ -3203,6 +3213,34 @@ def _consume_throw_in_context_without_tactic(store, reason: str) -> None:
     store.throw_in_last_reason = reason
 
 
+def _hold_throw_in_context_for_retry(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+    reason: str,
+) -> None:
+    """初始化所需观测暂不可用时安全等待，但不消费本次界外球。"""
+    store.active_tactic = None
+    store.locked_roles = None
+    store.tactic_roles = None
+    store.throw_in_state = None
+    store.throw_in_context_consumed = False
+    store.throw_in_last_outcome = "init_wait"
+    store.throw_in_last_reason = reason
+
+    field_players = [player for player in players if player is not goalkeeper]
+    _guard_throw_in_goalkeeper(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+    )
+    for player in field_players:
+        player.stop()
+        player.action = f"throw_in:init_wait:{reason}"
+
+
 def _synchronize_throw_in_tactic_context(
     context: Context,
     players: list[Player],
@@ -3815,6 +3853,31 @@ def _draw_throw_in_plan(state: ThrowInTacticState) -> None:
             scale=0.16,
             ns="throw_in_receiver_target",
         )
+
+
+def _draw_throw_in_status(context: Context, store) -> None:
+    """把界外球内部锁存状态画出来，便于手动判断卡住原因。"""
+    from .framework import debugdraw
+
+    state = getattr(store, "throw_in_state", None)
+    stage = (
+        state.stage.value
+        if isinstance(state, ThrowInTacticState)
+        else "none"
+    )
+    debugdraw.text(
+        0.0,
+        context.field.width / 2.0 + 0.6,
+        (
+            f"throw_in active={getattr(store, 'active_tactic', None)} "
+            f"stage={stage} "
+            "consumed="
+            f"{getattr(store, 'throw_in_context_consumed', False)} "
+            f"reason={getattr(store, 'throw_in_last_reason', None)}"
+        ),
+        rgb=(0.2, 1.0, 1.0),
+        ns="throw_in_state",
+    )
 
 
 def _get_throw_in_roles(
@@ -4447,6 +4510,7 @@ def _act_consumed_throw_in_fallback(
     store,
 ) -> None:
     """同一界外球已结束时保持安全站位，绝不重新进入固定流程。"""
+    _draw_throw_in_status(context, store)
     field_players = [player for player in players if player is not goalkeeper]
     _guard_throw_in_goalkeeper(
         context,
@@ -4454,9 +4518,10 @@ def _act_consumed_throw_in_fallback(
         field_players,
         store,
     )
+    reason = getattr(store, "throw_in_last_reason", None) or "unknown"
     for player in field_players:
         player.stop()
-        player.action = "throw_in:consumed:hold"
+        player.action = f"throw_in:consumed:{reason}"
 
 
 def _act_our_throw_in(
@@ -4466,6 +4531,7 @@ def _act_our_throw_in(
     store,
 ) -> None:
     """执行我方界外球专用固定战术及同上下文防重启。"""
+    _draw_throw_in_status(context, store)
     if not _is_our_throw_in_context(context):
         if getattr(store, "active_tactic", None) == "throw_in":
             _abort_throw_in(players, store, "game_context_changed")
@@ -4499,15 +4565,12 @@ def _act_our_throw_in(
             )
             return
         if context.ball is None:
-            _consume_throw_in_context_without_tactic(
-                store,
-                "ball_unavailable",
-            )
-            _act_consumed_throw_in_fallback(
+            _hold_throw_in_context_for_retry(
                 context,
                 players,
                 goalkeeper,
                 store,
+                "ball_unavailable",
             )
             return
 
@@ -4532,16 +4595,26 @@ def _act_our_throw_in(
             receiver,
         )
         if state is None:
-            _consume_throw_in_context_without_tactic(
-                store,
-                planning_error or "planning_failed",
-            )
-            _act_consumed_throw_in_fallback(
-                context,
-                players,
-                goalkeeper,
-                store,
-            )
+            planning_failure_reason = planning_error or "planning_failed"
+            if planning_failure_reason in _THROW_IN_TRANSIENT_INIT_FAILURES:
+                _hold_throw_in_context_for_retry(
+                    context,
+                    players,
+                    goalkeeper,
+                    store,
+                    planning_failure_reason,
+                )
+            else:
+                _consume_throw_in_context_without_tactic(
+                    store,
+                    planning_failure_reason,
+                )
+                _act_consumed_throw_in_fallback(
+                    context,
+                    players,
+                    goalkeeper,
+                    store,
+                )
             return
 
         store.active_tactic = "throw_in"
