@@ -347,9 +347,16 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         game_state = g.state.value if g is not None else "none"
         set_play = g.set_play.value if g is not None else "none"
         secondary_time = g.secondary_time if g is not None else 0.0
+        stopped = g.stopped if g is not None else None
+        kicking_team = g.kicking_team if g is not None else None
         debugdraw.text(
             0.0, context.field.width / 2.0 + 0.2,
-            f"phase={phase.value} state={game_state} set={set_play} secondary={secondary_time:.1f}",
+            (
+                f"phase={phase.value} state={game_state} "
+                f"stopped={stopped} set={set_play} "
+                f"kick={kicking_team} team={context.team_id} "
+                f"secondary={secondary_time:.1f}"
+            ),
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
 
@@ -4086,12 +4093,8 @@ def _act_throw_in_positioning(
             "ball_moved_before_kick",
         )
         return
-    if (
-        context.now - state.stage_started_at
-        >= THROW_IN_POSITIONING_TIMEOUT_SEC
-    ):
-        _abort_throw_in(players, store, "positioning_timeout")
-        return
+    positioning_elapsed = context.now - state.stage_started_at
+    positioning_timed_out = positioning_elapsed >= THROW_IN_POSITIONING_TIMEOUT_SEC
 
     if (
         state.region == ThrowInRegion.BACKFIELD
@@ -4124,7 +4127,7 @@ def _act_throw_in_positioning(
     kicker.walk_to(
         state.kicker_stage_target,
         face=kick_direction,
-        avoid_ball=True,
+        avoid_ball=False,
         avoid_robots=True,
         arrive_dist=THROW_IN_KICKER_READY_DISTANCE_M,
     )
@@ -4158,7 +4161,16 @@ def _act_throw_in_positioning(
         )
 
     solo = receiver is None
-    if kicker_position_ready and kicker_heading_ready and receiver_ready:
+    heading_wait_expired = positioning_elapsed >= 1.2
+    receiver_wait_expired = positioning_elapsed >= 2.0
+    heading_ready_enough = kicker_heading_ready or heading_wait_expired
+    receiver_ready_enough = receiver_ready or receiver_wait_expired
+    should_start_kick = (
+        kicker_position_ready
+        and heading_ready_enough
+        and receiver_ready_enough
+    )
+    if should_start_kick:
         kicker.action = (
             "throw_in:solo:position"
             if solo
@@ -4167,6 +4179,24 @@ def _act_throw_in_positioning(
         state.stage = ThrowInStage.KICKING
         state.stage_started_at = context.now
         state.kicking_start_ball_position = (ball.x, ball.y)
+        return
+
+    if positioning_timed_out:
+        _abort_throw_in(players, store, "positioning_timeout")
+        return
+
+    if not kicker_position_ready:
+        kicker.action = (
+            "throw_in:solo:position"
+            if solo
+            else "throw_in:kicker:position"
+        )
+        return
+    if not heading_ready_enough:
+        kicker.action = "throw_in:kicker:wait_heading"
+        return
+    if not receiver_ready_enough:
+        kicker.action = "throw_in:kicker:wait_receiver"
         return
     kicker.action = (
         "throw_in:solo:position"
