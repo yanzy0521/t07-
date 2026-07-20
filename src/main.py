@@ -273,10 +273,16 @@ def get_phase(context: Context) -> Phase:
             else:
                 return Phase.OPP_SET_PLAY
 
-        # 开球:secondary_time > 0(倒计时窗口),kicking_team 指示哪方
-        if g.secondary_time > 0 and g.kicking_team != KICKING_TEAM_NONE:
+        # 中场开球只在球仍位于中圈附近时由 GameController 授权。
+        # 若裁判机在正常比赛中延迟保留 kicking_team，不应持续覆盖普通攻防。
+        ball = context.ball
+        ball_near_center = (
+            ball is not None
+            and math.hypot(ball.x, ball.y) <= OUR_KICKOFF_CENTER_ORIGIN_TOLERANCE_M
+        )
+        if g.kicking_team != KICKING_TEAM_NONE and ball_near_center:
             our_team = context.team_id
-            if g.kicking_team == our_team:
+            if _game_controller_team_matches_us(g.kicking_team, our_team):
                 return Phase.OUR_KICKOFF
             else:
                 return Phase.OPP_KICKOFF
@@ -388,10 +394,16 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.our_kickoff_context_consumed = False
         store.our_kickoff_last_outcome = None
         store.our_kickoff_last_reason = None
+        store.our_kickoff_ready_armed = False
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
         phase = get_phase(context)
+        if phase == Phase.NORMAL and (
+            _is_armed_our_kickoff_context(context, store)
+            or _is_continuing_our_kickoff_context(context, store)
+        ):
+            phase = Phase.OUR_KICKOFF
         store.prev_phase = store.cur_phase
         store.cur_phase = phase
 
@@ -3075,7 +3087,11 @@ def _act_our_kickoff(
             store,
             allow_active_response=False,
         )
-    if not _is_our_kickoff_context(context):
+    if not (
+        _is_our_kickoff_context(context)
+        or _is_armed_our_kickoff_context(context, store)
+        or _is_continuing_our_kickoff_context(context, store)
+    ):
         _finish_our_kickoff_tactic(
             players,
             store,
@@ -3149,9 +3165,9 @@ def _act_our_kickoff(
         )
         return
 
-    if _our_kickoff_abort_reason(context, passer, receiver, goalkeeper, state) is not None:
+    if _our_kickoff_abort_reason(context, passer, receiver, goalkeeper, state, store) is not None:
         reason = _our_kickoff_abort_reason(
-            context, passer, receiver, goalkeeper, state,
+            context, passer, receiver, goalkeeper, state, store,
         )
         _finish_our_kickoff_tactic(
             players,
@@ -3203,9 +3219,76 @@ def _is_our_kickoff_context(context: Context) -> bool:
         and game.state == GameState.PLAYING
         and not game.stopped
         and game.set_play == SetPlay.NONE
-        and game.secondary_time > 0
-        and game.kicking_team == context.team_id
+        and _game_controller_team_matches_us(
+            game.kicking_team,
+            context.team_id,
+        )
     )
+
+
+def _is_armed_our_kickoff_context(context: Context, store) -> bool:
+    """READY 已按我方开球布阵时，兼容 PLAYING 后 kicking_team 被清空的实现。"""
+    game = context.game
+    ball = context.ball
+    return (
+        getattr(store, "our_kickoff_ready_armed", False)
+        and not getattr(store, "our_kickoff_context_consumed", False)
+        and game is not None
+        and game.state == GameState.PLAYING
+        and not game.stopped
+        and game.set_play == SetPlay.NONE
+        and ball is not None
+        and math.hypot(ball.x, ball.y) <= OUR_KICKOFF_CENTER_ORIGIN_TOLERANCE_M
+    )
+
+
+def _is_continuing_our_kickoff_context(context: Context, store) -> bool:
+    """固定开球已启动后，允许其在球离开中圈后完成传球确认。"""
+    game = context.game
+    return (
+        getattr(store, "active_tactic", None) == "our_kickoff"
+        and getattr(store, "our_kickoff_state", None) is not None
+        and game is not None
+        and game.state == GameState.PLAYING
+        and not game.stopped
+        and game.set_play == SetPlay.NONE
+    )
+
+
+def _synchronize_our_kickoff_ready_arming(context: Context, store) -> None:
+    """READY/SET 期间记录下一次 PLAYING 应执行我方中场开球战术。
+
+    进球后的重开常见形态是 READY/SET 同时 stopped=True；顶层 phase 会按
+    STOPPED 处理，导致 _act_ready() 不一定有机会设置 armed。这里直接根据
+    GameController 的中场开球归属武装下一次 PLAYING，确保不只开场使用该战术。
+    """
+    game = context.game
+    if game is None:
+        return
+
+    restart_is_waiting_for_play = game.state in (GameState.READY, GameState.SET)
+    if not restart_is_waiting_for_play or game.set_play != SetPlay.NONE:
+        return
+
+    if game.kicking_team == KICKING_TEAM_NONE:
+        # Some GameController streams clear kicking_team during SET. Preserve
+        # the READY-stage arming instead of forgetting this is still the same
+        # midfield restart.
+        return
+
+    if _game_controller_team_matches_us(game.kicking_team, context.team_id):
+        store.our_kickoff_ready_armed = True
+        store.our_kickoff_context_consumed = False
+        store.our_kickoff_state = None
+        store.our_kickoff_last_outcome = None
+        store.our_kickoff_last_reason = None
+        if getattr(store, "active_tactic", None) == "our_kickoff":
+            store.active_tactic = None
+            store.locked_roles = None
+            store.tactic_roles = None
+        return
+
+    store.our_kickoff_ready_armed = False
 
 
 def _synchronize_our_kickoff_tactic_context(
@@ -3214,7 +3297,12 @@ def _synchronize_our_kickoff_tactic_context(
     store,
 ) -> None:
     """裁判上下文变化时终止开球固定战术，并在离开后允许下次开球。"""
-    our_kickoff_context = _is_our_kickoff_context(context)
+    _synchronize_our_kickoff_ready_arming(context, store)
+    our_kickoff_context = (
+        _is_our_kickoff_context(context)
+        or _is_armed_our_kickoff_context(context, store)
+        or _is_continuing_our_kickoff_context(context, store)
+    )
     if (
         getattr(store, "active_tactic", None) == "our_kickoff"
         and not our_kickoff_context
@@ -3262,7 +3350,7 @@ def _build_our_kickoff_geometry(
     origin: tuple[float, float],
     side: float,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-    """由球位和稳定镜像侧生成 passer / receiver / pass 目标。"""
+    """由球位生成图中固定开球站位：两名前场都在我方半场。"""
     passer_target = _clamp_our_kickoff_target(
         context,
         (
@@ -3273,17 +3361,11 @@ def _build_our_kickoff_geometry(
     receiver_target = _clamp_our_kickoff_target(
         context,
         (
-            origin[0] + OUR_KICKOFF_RECEIVER_FORWARD_DISTANCE_M,
+            origin[0] - OUR_KICKOFF_RECEIVER_OWN_HALF_DISTANCE_M,
             origin[1] + side * OUR_KICKOFF_RECEIVER_LATERAL_OFFSET_M,
         ),
     )
-    pass_target = _clamp_our_kickoff_target(
-        context,
-        (
-            receiver_target[0] + OUR_KICKOFF_PASS_TARGET_FORWARD_BIAS_M,
-            receiver_target[1],
-        ),
-    )
+    pass_target = receiver_target
     return passer_target, receiver_target, pass_target
 
 
@@ -3304,11 +3386,11 @@ def _select_our_kickoff_roles_and_side(
     field_players: list[Player],
     origin: tuple[float, float],
 ) -> tuple[Player, Player, float, tuple[float, float], tuple[float, float], tuple[float, float]]:
-    """一次性锁定 passer、receiver 和上下镜像侧，避免每帧换人。"""
+    """一次性锁定 passer、receiver 和图片默认上侧站位，避免每帧换人。"""
     ranked_options: list[
         tuple[float, int, int, float, Player, Player, tuple[float, float], tuple[float, float], tuple[float, float]]
     ] = []
-    for side in (-1.0, 1.0):
+    for side in (1.0,):
         passer_target, receiver_target, pass_target = _build_our_kickoff_geometry(
             context,
             origin,
@@ -3335,13 +3417,13 @@ def _select_our_kickoff_roles_and_side(
                 passer_behind_bonus = (
                     -0.35 if passer.pose.x <= origin[0] else 0.35
                 )
-                receiver_front_bonus = (
-                    -0.20 if receiver.pose.x >= origin[0] else 0.20
+                receiver_own_half_bonus = (
+                    -0.20 if receiver.pose.x <= origin[0] else 0.20
                 )
                 ranked_options.append(
                     (
                         passer_cost + receiver_cost
-                        + passer_behind_bonus + receiver_front_bonus,
+                        + passer_behind_bonus + receiver_own_half_bonus,
                         passer.id,
                         receiver.id,
                         side,
@@ -3378,7 +3460,11 @@ def _try_initialize_our_kickoff_tactic(
     if ball is None:
         store.our_kickoff_last_reason = "ball_unavailable"
         return False
-    if not _is_our_kickoff_context(context):
+    if not (
+        _is_our_kickoff_context(context)
+        or _is_armed_our_kickoff_context(context, store)
+        or _is_continuing_our_kickoff_context(context, store)
+    ):
         store.our_kickoff_last_reason = "not_our_kickoff_context"
         return False
     if len(field_players) < 2:
@@ -3404,6 +3490,20 @@ def _try_initialize_our_kickoff_tactic(
             "no_valid_role_assignment",
         )
         return False
+
+    # 接应人按图片站位只原地面向球，不由固定程序移动；传球目标锁定到
+    # 接应人当前脚下，确保开球人第一脚只做定向传球。
+    if receiver.pose is None:
+        _consume_our_kickoff_context_without_tactic(
+            store,
+            "receiver_pose_unavailable",
+        )
+        return False
+    receiver_target = _clamp_our_kickoff_target(
+        context,
+        (receiver.pose.x, receiver.pose.y),
+    )
+    pass_target = receiver_target
 
     pass_direction = _get_our_kickoff_direction(origin, pass_target)
     store.active_tactic = "our_kickoff"
@@ -3442,6 +3542,7 @@ def _consume_our_kickoff_context_without_tactic(store, reason: str) -> None:
     store.our_kickoff_context_consumed = True
     store.our_kickoff_last_outcome = OurKickoffStage.ABORTED.value
     store.our_kickoff_last_reason = reason
+    store.our_kickoff_ready_armed = False
 
 
 def _finish_our_kickoff_tactic(
@@ -3469,6 +3570,7 @@ def _finish_our_kickoff_tactic(
     store.our_kickoff_context_consumed = True
     store.our_kickoff_last_outcome = outcome.value
     store.our_kickoff_last_reason = reason
+    store.our_kickoff_ready_armed = False
 
 
 def _our_kickoff_abort_reason(
@@ -3477,10 +3579,14 @@ def _our_kickoff_abort_reason(
     receiver: Player,
     goalkeeper: Player | None,
     state: OurKickoffTacticState,
+    store,
 ) -> str | None:
     """检查不应继续执行固定开球的裁判、观测和角色条件。"""
     ball = context.ball
-    if not _is_our_kickoff_context(context):
+    if not (
+        _is_our_kickoff_context(context)
+        or _is_armed_our_kickoff_context(context, store)
+    ):
         return "game_context_changed"
     if ball is None:
         return "ball_unavailable"
@@ -3564,60 +3670,8 @@ def _run_our_kickoff_tactic(
         return
 
     if state.stage in (OurKickoffStage.POSITIONING, OurKickoffStage.READY_TO_PASS):
-        receiver_face = angle_to(
-            state.receiver_target[0],
-            state.receiver_target[1],
-            state.origin[0],
-            state.origin[1],
-        )
-        passer_face = angle_to(
-            state.passer_target[0],
-            state.passer_target[1],
-            state.pass_target[0],
-            state.pass_target[1],
-        )
-        passer_arrived = passer.walk_to(
-            state.passer_target,
-            face=passer_face,
-            avoid_ball=True,
-            avoid_robots=True,
-            arrive_dist=OUR_KICKOFF_PASSER_READY_DISTANCE_M,
-        )
-        receiver_arrived = receiver.walk_to(
-            state.receiver_target,
-            face=receiver_face,
-            avoid_ball=True,
-            avoid_robots=True,
-            arrive_dist=OUR_KICKOFF_RECEIVER_READY_DISTANCE_M,
-        )
-        passer.action = "kickoff:passer:position"
-        receiver.action = "kickoff:receiver:position"
-
-        receiver_heading_ready = _player_heading_is_ready(
-            receiver,
-            receiver_face,
-        )
-        if passer_arrived and receiver_arrived and receiver_heading_ready:
-            _advance_our_kickoff_stage(
-                state,
-                OurKickoffStage.READY_TO_PASS,
-                context.now,
-            )
-            passer.action = "kickoff:passer:wait_receiver"
-            receiver.action = "kickoff:receiver:ready"
-        elif context.now - state.stage_started_at > OUR_KICKOFF_POSITIONING_TIMEOUT_SEC:
-            _finish_our_kickoff_tactic(
-                players,
-                store,
-                OurKickoffStage.ABORTED,
-                "positioning_timeout",
-            )
-            return
-        else:
-            _stop_unassigned_kickoff_field_players(field_players, passer, receiver)
-            return
-
-    if state.stage == OurKickoffStage.READY_TO_PASS:
+        # READY 阶段完成图中准备站位；PLAYING 后进入强制传球流程。
+        # 若 passer 离球还远，PASSING 阶段会先贴近球再定向传给接应人。
         _advance_our_kickoff_stage(
             state,
             OurKickoffStage.PASSING,
@@ -3627,16 +3681,50 @@ def _run_our_kickoff_tactic(
     if state.stage == OurKickoffStage.PASSING:
         if state.passing_start_ball_position is None:
             state.passing_start_ball_position = (ball.x, ball.y)
-        passer.directed_restart_kick(state.pass_target, state.pass_power)
-        receiver.walk_to(
-            state.receiver_target,
-            face=_receiver_face_angle_for_kickoff(receiver, state),
-            avoid_ball=False,
-            avoid_robots=True,
-            arrive_dist=OUR_KICKOFF_RECEIVER_READY_DISTANCE_M,
-        )
-        passer.action = "kickoff:passer:pass"
+        receiver.face_to(_receiver_face_angle_for_kickoff(receiver, state))
         receiver.action = "kickoff:receiver:ready"
+
+        if passer.pose is None:
+            _finish_our_kickoff_tactic(
+                players,
+                store,
+                OurKickoffStage.ABORTED,
+                "passer_pose_lost",
+            )
+            return
+
+        passer_ball_distance = dist(
+            passer.pose.x,
+            passer.pose.y,
+            ball.x,
+            ball.y,
+        )
+        if passer_ball_distance > OUR_KICKOFF_PASSER_TOUCH_DISTANCE_M:
+            # 图中站位是准备位，不是触球位；开球后必须先靠近球，否则 kick
+            # manager 只会收到命令但球不在脚边，实际不会形成第一脚传球。
+            approach_target = _clamp_our_kickoff_target(
+                context,
+                (
+                    ball.x - state.pass_direction[0]
+                    * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
+                    ball.y - state.pass_direction[1]
+                    * OUR_KICKOFF_PASSER_APPROACH_BEHIND_BALL_M,
+                ),
+            )
+            passer.release_kick()
+            passer.walk_to(
+                approach_target,
+                face=angle_to(ball.x, ball.y, *state.pass_target),
+                avoid_ball=False,
+                avoid_robots=True,
+                arrive_dist=OUR_KICKOFF_PASSER_APPROACH_ARRIVE_DISTANCE_M,
+            )
+            passer.action = "kickoff:passer:approach_ball_to_pass"
+            _stop_unassigned_kickoff_field_players(field_players, passer, receiver)
+            return
+
+        passer.directed_restart_kick(state.pass_target, state.pass_power)
+        passer.action = "kickoff:passer:pass"
         state.pass_command_started = True
 
         progress, lateral_error = _measure_our_kickoff_pass_progress(
@@ -3765,16 +3853,10 @@ def _act_our_kickoff_receiving(
             OurKickoffStage.COMPLETE,
             "receiver_can_process",
         )
-        _act_offensive_ball_handler(receiver, "kickoff_receiver")
-        receiver.action = "kickoff:receiver:shoot"
+        receiver.face_to(_receiver_face_angle_for_kickoff(receiver, state))
+        receiver.action = "kickoff:receiver:received"
     else:
-        receiver.walk_to(
-            (ball.x, ball.y),
-            face=_receiver_face_angle_for_kickoff(receiver, state),
-            avoid_ball=False,
-            avoid_robots=True,
-            arrive_dist=OUR_KICKOFF_RECEIVER_BALL_DISTANCE_M,
-        )
+        receiver.face_to(_receiver_face_angle_for_kickoff(receiver, state))
         receiver.action = "kickoff:receiver:receive"
         _stop_unassigned_kickoff_field_players(field_players, passer, receiver)
 
@@ -3881,7 +3963,7 @@ def _act_safe_our_kickoff_fallback(
     safe_target = _clamp_our_kickoff_target(
         context,
         (
-            ball.x + OUR_KICKOFF_RECEIVER_FORWARD_DISTANCE_M * 0.65,
+            ball.x - OUR_KICKOFF_RECEIVER_OWN_HALF_DISTANCE_M * 0.65,
             ball.y + side * OUR_KICKOFF_RECEIVER_LATERAL_OFFSET_M,
         ),
     )
@@ -6079,12 +6161,18 @@ def _act_ready(
     goalkeeper: Player | None,
     store,
 ) -> None:
-    """READY:当前守门员进门前位置,场上机器人使用既有保守站位。"""
+    """READY:开场阶段提前按固定开球图站好。"""
     if not players:
         return
 
     game = context.game
-    our_kickoff = game is not None and game.kicking_team == context.team_id
+    our_kickoff = (
+        game is not None
+        and _game_controller_team_matches_us(
+            game.kicking_team,
+            context.team_id,
+        )
+    )
     field = context.field
     if goalkeeper is not None:
         goalkeeper.action = (
@@ -6103,11 +6191,11 @@ def _act_ready(
         player for player in players if player is not goalkeeper
     ]
     if our_kickoff:
-        ready_targets = [
-            (-field.circle_radius, 0.0),
-            (-0.5, field.circle_radius + 2.0),
-        ]
+        store.our_kickoff_ready_armed = True
+        _act_ready_our_kickoff_shape(context, field_players, store)
+        return
     else:
+        store.our_kickoff_ready_armed = False
         ready_targets = [
             (-field.circle_radius - 0.5, 0.0),
             (-field.length / 2.0 + field.penalty_area_length, 0.0),
@@ -6124,6 +6212,81 @@ def _act_ready(
 
     for player in field_players[len(ready_targets):]:
         player.action = "ready:hold"
+        player.stop()
+
+
+def _act_ready_our_kickoff_shape(
+    context: Context,
+    field_players: list[Player],
+    store,
+) -> None:
+    """READY 时直接按图中两名进攻机器人站位，避免 PLAYING 后再找位置。"""
+    if not field_players:
+        store.kickoff_taker = None
+        return
+
+    ball = context.ball
+    origin = (ball.x, ball.y) if ball is not None else (0.0, 0.0)
+    if len(field_players) < 2:
+        single_target = _clamp_our_kickoff_target(
+            context,
+            (
+                origin[0] - OUR_KICKOFF_PASSER_BEHIND_DISTANCE_M,
+                origin[1] - OUR_KICKOFF_PASSER_LATERAL_OFFSET_M,
+            ),
+        )
+        single_player = field_players[0]
+        single_player.walk_to(
+            single_target,
+            face=angle_to(single_target[0], single_target[1], *origin),
+            avoid_ball=True,
+            avoid_robots=True,
+            arrive_dist=OUR_KICKOFF_PASSER_READY_DISTANCE_M,
+        )
+        single_player.action = "ready:kickoff:single_passer"
+        store.kickoff_taker = single_player.id
+        return
+
+    try:
+        (
+            passer,
+            receiver,
+            _side,
+            passer_target,
+            receiver_target,
+            pass_target,
+        ) = _select_our_kickoff_roles_and_side(context, field_players, origin)
+    except ValueError:
+        for player in field_players:
+            player.action = "ready:kickoff:no_pose"
+            player.stop()
+        return
+
+    store.kickoff_taker = passer.id
+    store.our_kickoff_ready_receiver_id = receiver.id
+
+    passer.walk_to(
+        passer_target,
+        face=angle_to(passer_target[0], passer_target[1], *pass_target),
+        avoid_ball=True,
+        avoid_robots=True,
+        arrive_dist=OUR_KICKOFF_PASSER_READY_DISTANCE_M,
+    )
+    passer.action = "ready:kickoff:passer"
+
+    receiver.walk_to(
+        receiver_target,
+        face=angle_to(receiver_target[0], receiver_target[1], *origin),
+        avoid_ball=True,
+        avoid_robots=True,
+        arrive_dist=OUR_KICKOFF_RECEIVER_READY_DISTANCE_M,
+    )
+    receiver.action = "ready:kickoff:receiver"
+
+    for player in field_players:
+        if player is passer or player is receiver:
+            continue
+        player.action = "ready:kickoff:extra_hold"
         player.stop()
 
 
