@@ -4070,7 +4070,13 @@ def _act_throw_in_positioning(
         dist(ball.x, ball.y, state.origin[0], state.origin[1])
         > THROW_IN_BALL_ORIGIN_TOLERANCE_M
     ):
-        _abort_throw_in(players, store, "ball_moved_before_kick")
+        _hold_throw_in_context_for_retry(
+            context,
+            players,
+            goalkeeper,
+            store,
+            "ball_moved_before_kick",
+        )
         return
     if (
         context.now - state.stage_started_at
@@ -4197,7 +4203,13 @@ def _act_throw_in_kicking(
     )
     if not state.kick_command_started:
         if movement > THROW_IN_BALL_ORIGIN_TOLERANCE_M:
-            _abort_throw_in(players, store, "ball_moved_before_kick")
+            _hold_throw_in_context_for_retry(
+                context,
+                players,
+                goalkeeper,
+                store,
+                "ball_moved_before_kick",
+            )
             return
         kicker.directed_restart_kick(state.pass_target, state.pass_power)
         state.kick_command_started = True
