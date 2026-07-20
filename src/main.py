@@ -1913,7 +1913,7 @@ def _get_goalkeeper_block_target(
     context: Context,
     ball_velocity: tuple[float, float] | None,
 ) -> tuple[float, float]:
-    """计算球运动射线在门前封堵 X 上的交点。"""
+    """计算门前封堵点，优先拦截运动射线，否则压住球门连线。"""
     own_goal_x, _own_goal_y = own_goal(context)
     block_x = own_goal_x + GOALKEEPER_BLOCK_X_OFFSET_M
     home_target = _get_goalkeeper_home_target(context)
@@ -1925,6 +1925,11 @@ def _get_goalkeeper_block_target(
             time_to_block_x = (block_x - ball.x) / velocity_x
             if time_to_block_x >= 0.0:
                 block_y = ball.y + velocity_y * time_to_block_x
+    elif ball is not None and ball.x > own_goal_x:
+        ball_to_goal_x = own_goal_x - ball.x
+        if abs(ball_to_goal_x) > 1e-6:
+            line_ratio = (block_x - ball.x) / ball_to_goal_x
+            block_y = ball.y * (1.0 - line_ratio)
 
     lateral_limit = _goalkeeper_safe_lateral_limit(context)
     return (
@@ -2125,6 +2130,9 @@ def _update_goalkeeper_mode(
     ):
         candidate_mode = GoalkeeperMode.CLEAR
         reason = "clear_min_hold"
+    elif ball_clearable:
+        candidate_mode = GoalkeeperMode.CLEAR
+        reason = "danger_ball_in_clear_range"
     elif current_mode == GoalkeeperMode.RETURN and not _goalkeeper_has_returned(
         goalkeeper, home_target,
     ):
@@ -2134,9 +2142,6 @@ def _update_goalkeeper_mode(
         else:
             candidate_mode = GoalkeeperMode.RETURN
             reason = "returning_home"
-    elif ball_clearable:
-        candidate_mode = GoalkeeperMode.CLEAR
-        reason = "danger_ball_in_clear_range"
     elif can_challenge:
         candidate_mode = GoalkeeperMode.CHALLENGE
         reason = "goalkeeper_arrives_first"
@@ -2317,9 +2322,12 @@ def _act_goalkeeper_strategy(
         if ball is not None else math.inf
     )
     clear_distance_limit = (
-        GOALKEEPER_CLEAR_EXIT_DISTANCE_M
+        max(
+            GOALKEEPER_CLEAR_EXIT_DISTANCE_M,
+            GOALKEEPER_CLEAR_APPROACH_DISTANCE_M,
+        )
         if current_mode == GoalkeeperMode.CLEAR
-        else GOALKEEPER_CLEAR_ENTER_DISTANCE_M
+        else GOALKEEPER_CLEAR_APPROACH_DISTANCE_M
     )
     ball_clearable = (
         allow_active_response
