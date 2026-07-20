@@ -328,6 +328,32 @@ class Player:
             <= OFFENSIVE_STRIKER_DISRUPT_OPPONENT_DISTANCE_M
         )
 
+    def _should_soft_dribble_forward(
+        self,
+        ball_distance: float,
+        alignment_error: float,
+    ) -> bool:
+        """近球进攻时小力向前推球，避免为了完美球后位损失出脚速度。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        pose = self.pose
+        if context is None or ball is None or pose is None:
+            return False
+
+        opponent_goal_x = context.field.length / 2.0
+        too_close_to_goal_for_dribble = (
+            ball.x
+            >= opponent_goal_x - OFFENSIVE_STRIKER_SOFT_DRIBBLE_GOAL_MARGIN_M
+        )
+        if too_close_to_goal_for_dribble:
+            return False
+
+        return (
+            ball_distance <= OFFENSIVE_STRIKER_SOFT_DRIBBLE_DISTANCE_M
+            and alignment_error
+            <= OFFENSIVE_STRIKER_SOFT_DRIBBLE_MAX_ALIGNMENT_RAD
+        )
+
     def _chase_ball_aggressively(self) -> None:
         """以持续高速全向压迫球点，不执行通用走位的减速或转向等待。"""
         context = self.context
@@ -1022,6 +1048,10 @@ class Player:
             kick_direction, _kick_power = kick_plan
             self.kick(kick_direction, OFFENSIVE_STRIKER_DISRUPT_POWER)
             self.action = "offensive_striker:disrupt"
+        elif self._should_soft_dribble_forward(d, alignment_error):
+            self._reset_ball_approach()
+            self.kick(kick_direction, OFFENSIVE_STRIKER_SOFT_DRIBBLE_POWER)
+            self.action = "offensive_striker:soft_dribble"
         else:
             self.release_kick()
             approach_target, kick_direction = self._ball_approach_target(
